@@ -89,6 +89,17 @@ The injected preload bridge (`tv-mpv-bridge.js`) polls physical controllers at 6
 | **View / Select (Button 8)** | `Backspace` | Quick back. |
 | **Menu / Start (Button 9)** | `Escape` | Menu / dismiss overlay controls. |
 
+### 2.4GHz USB HID Remote Control Support
+The bridge automatically normalizes input from USB air remotes (WeChip, G10/G20, Minix, OSMC, Fire TV USB remotes):
+
+| USB Remote Button | Normalized Key | Function in Stremio TV |
+|---|---|---|
+| **Back / Return / Exit** | `Backspace` (8) | Back to previous view / exit player. |
+| **Play / Pause** | `Spacebar` (32) | Toggle playback. |
+| **Rewind ($\ll$)** | `KeyE` (69) | Seek backward 10s. |
+| **Fast Forward ($\gg$)** | `KeyH` (72) | Seek forward 10s. |
+| **Menu / Context** | `Escape` (27) | Open / dismiss sidebar drawer. |
+
 ---
 
 ## Steam Game Mode Configuration

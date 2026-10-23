@@ -263,5 +263,57 @@
     // Start immediately in case controller is already connected
     startPolling();
 
+    // 3. 2.4GHz USB HID Remote Control Normalizer
+    // Normalizes USB air remotes, G10/G20, WeChip, and Android TV USB dongles
+    window.addEventListener('keydown', (e) => {
+        if (e.isBridgeSynthetic) return;
+
+        let mapped = null;
+        switch (e.key) {
+            case 'BrowserBack':
+            case 'GoBack':
+            case 'Back':
+                mapped = { key: 'Backspace', code: 'Backspace', keyCode: 8 };
+                break;
+            case 'MediaPlayPause':
+            case 'MediaPlay':
+            case 'MediaPause':
+                mapped = { key: ' ', code: 'Space', keyCode: 32 };
+                break;
+            case 'MediaTrackPrevious':
+            case 'MediaRewind':
+                mapped = { key: 'e', code: 'KeyE', keyCode: 69 };
+                break;
+            case 'MediaTrackNext':
+            case 'MediaFastForward':
+                mapped = { key: 'h', code: 'KeyH', keyCode: 72 };
+                break;
+            case 'ContextMenu':
+                mapped = { key: 'Escape', code: 'Escape', keyCode: 27 };
+                break;
+        }
+
+        if (mapped) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const syntheticEvt = new KeyboardEvent('keydown', {
+                key: mapped.key,
+                code: mapped.code,
+                keyCode: mapped.keyCode,
+                which: mapped.keyCode,
+                bubbles: true,
+                cancelable: true,
+                view: window
+            });
+            syntheticEvt.isBridgeSynthetic = true;
+
+            const target = document.activeElement && document.activeElement !== document.body
+                ? document.activeElement
+                : document;
+            target.dispatchEvent(syntheticEvt);
+        }
+    }, true);
+
     console.log("[Stremio TV Bridge] Preload bridge loaded successfully.");
 })();
