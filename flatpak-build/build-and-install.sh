@@ -18,36 +18,35 @@ if ! command -v flatpak &>/dev/null; then
     exit 1
 fi
 
-if ! command -v flatpak-builder &>/dev/null; then
-    echo "[!] 'flatpak-builder' not found in path."
-    echo "[*] Attempting to install flatpak-builder via flathub or ostree..."
-    if command -v rpm-ostree &>/dev/null; then
-        echo "Please install flatpak-builder using: ujust install flatpak-builder OR rpm-ostree install flatpak-builder"
-        exit 1
-    elif command -v dnf &>/dev/null; then
-        sudo dnf install -y flatpak-builder
-    else
-        echo "[-] Please install flatpak-builder and re-run this script."
-        exit 1
-    fi
-fi
-
 # 2. Add Flathub repository if missing
 echo "[*] Ensuring Flathub remote is configured..."
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
-# 3. Install required GNOME 50 Runtime, SDK, and Rust extension
+# 3. Resolve flatpak-builder (host binary, or Flathub org.flatpak.Builder on immutable hosts)
+if command -v flatpak-builder &>/dev/null; then
+    FLATPAK_BUILDER=(flatpak-builder)
+else
+    echo "[!] 'flatpak-builder' not on PATH (expected on Bazzite/SteamOS)."
+    echo "[*] Using Flathub-packaged org.flatpak.Builder instead..."
+    flatpak install --user -y flathub org.flatpak.Builder
+    FLATPAK_BUILDER=(flatpak run org.flatpak.Builder)
+fi
+
+# 4. Install required GNOME 50 Runtime/SDK and extensions
+#    (SDK extensions follow the freedesktop base branch: GNOME 50 -> 25.08)
 echo "[*] Installing required Flatpak SDK & Runtime dependencies..."
-flatpak install --user -y flathub \
+flatpak install --user -y --noninteractive flathub \
     org.gnome.Platform//50 \
     org.gnome.Sdk//50 \
-    org.freedesktop.Sdk.Extension.rust-stable//50 \
-    org.freedesktop.Platform.codecs-extra//25.08-extra \
-    org.freedesktop.Platform.VAAPI.Intel//25.08 || true
+    org.freedesktop.Sdk.Extension.rust-stable//25.08 \
+    org.freedesktop.Platform.codecs-extra//25.08-extra || \
+    echo "[!] Some dependencies failed to pre-install; flatpak-builder will retry via --install-deps-from."
 
-# 4. Build and install custom Flatpak
+# 5. Build and install custom Flatpak
 echo "[*] Building and installing com.stremio.Stremio (TV Edition)..."
-flatpak-builder --user --install --force-clean build-dir com.stremio.Stremio.json
+"${FLATPAK_BUILDER[@]}" --user --install --force-clean \
+    --install-deps-from=flathub \
+    build-dir com.stremio.Stremio.json
 
 echo "[+] Stremio TV Flatpak installed successfully!"
 

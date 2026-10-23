@@ -158,6 +158,7 @@ This project is backed by deep reverse-engineering of Stremio's Android TV APK, 
 
 - [**Android TV Component Architecture Specification**](analysis/android-tv-components-spec.md): Full analysis of all 28 decompiled Android TV classes, horizontal Leanback carousels, catalog discovery, search, and ExoPlayer/MPV player wrappers.
 - [**Linux Shell IPC & Preload Bridge Report**](analysis/path-a-ipc-bridge.md): Deep dive into WebKitGTK IPC mechanisms, `ShellTransport` prototype injection, and the Gamepad API to Spatial Navigation bridge.
+- [**Master Deployment & REA Guide (v1.0)**](STREMIO_TV_FLATPAK_MASTER_GUIDE.md): Current consolidated guide, covering the Qt mock, mpv-set-prop validation, HID remotes and the build steps.
 - [**Full Reverse-Engineering Guide**](STREMIO_TV_FLATPAK_REA_GUIDE.md): Master blueprint and analysis log.
 
 ---

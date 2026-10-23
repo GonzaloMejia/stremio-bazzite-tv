@@ -19,6 +19,11 @@
         window.qt.webChannelTransport.onmessage = function(event) {};
     }
 
+    // Optional blocklist for mpv-set-prop names. Empty by default because the shell
+    // supports all property names ShellVideo sends. To reproduce the master guide's
+    // filtering, use: ['sub-color', 'sub-back-color', 'sub-border-color', 'sub-font-size']
+    const BLOCKED_SET_PROPS = [];
+
     // 1. Native MPV ShellTransport Bridge
     class ShellTransport {
         constructor() {
@@ -50,6 +55,28 @@
         }
 
         send(eventName, args) {
+            // MPV property setter validation.
+            // ShellVideo sends mpv-set-prop as an ARRAY: [name, value].
+            // stremio-linux-shell (src/app/ipc/request.rs) rejects:
+            //   - non-string names  -> "Invalid mpv-set-prop name"
+            //     (ShellVideo has no prop-name mapping for subtitlesOffset, so it sends [null, value])
+            //   - missing values    -> "Invalid mpv-set-prop value"
+            //     (ShellVideo sends ["no-sub-ass"] on every load)
+            // NOTE: sub-color / sub-back-color / sub-border-color are supported by the
+            // shell (src/app/video/config.rs STRING_PROPERTIES) and are intentionally passed through.
+            if (eventName === 'mpv-set-prop') {
+                const name = Array.isArray(args) ? args[0] : (args && args.name);
+                const hasValue = Array.isArray(args) ? args.length >= 2 : (args && 'value' in args);
+                if (typeof name !== 'string' || !hasValue) {
+                    console.debug("[Stremio TV Bridge] Dropped invalid mpv-set-prop:", JSON.stringify(args));
+                    return;
+                }
+                if (BLOCKED_SET_PROPS.includes(name)) {
+                    console.debug("[Stremio TV Bridge] Dropped blocked mpv-set-prop:", name);
+                    return;
+                }
+            }
+
             const payload = JSON.stringify({
                 type: 6,
                 args: [eventName, args]
@@ -270,6 +297,9 @@
 
         let mapped = null;
         switch (e.key) {
+            case 'Select':
+                mapped = { key: 'Enter', code: 'Enter', keyCode: 13 };
+                break;
             case 'BrowserBack':
             case 'GoBack':
             case 'Back':
