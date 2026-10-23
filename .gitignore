@@ -1,0 +1,22 @@
+# Binary packages & APK archives
+*.apkm
+*.apk
+*.zip
+*.tar.*
+*.flatpakref
+
+# Unpacked target and decompilation workspaces
+Stremio-android-tv/
+Stremio-flatpak/
+
+# Scratch & build caches
+scratch/
+build-dir/
+.flatpak-builder/
+*.log
+
+# Raw downloaded JavaScript bundles from inspection
+tv-stremio-*.js
+web-stremio-*.js
+web-stremio.html
+flatpak-stremio.json
