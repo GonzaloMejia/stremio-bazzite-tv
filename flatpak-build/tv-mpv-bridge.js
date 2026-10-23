@@ -5,6 +5,20 @@
 (function() {
     console.log("[Stremio TV Bridge] Initializing TV Shell Native MPV & Gamepad Bridge...");
 
+    // Mock Qt WebChannel transport for WebKitGTK compatibility
+    window.qt = window.qt || {};
+    window.qt.webChannelTransport = window.qt.webChannelTransport || {
+        onmessage: function(event) {},
+        send: function(message) {
+            if (window.ipc && typeof window.ipc.postMessage === 'function') {
+                window.ipc.postMessage(message);
+            }
+        }
+    };
+    if (typeof window.qt.webChannelTransport.onmessage !== 'function') {
+        window.qt.webChannelTransport.onmessage = function(event) {};
+    }
+
     // 1. Native MPV ShellTransport Bridge
     class ShellTransport {
         constructor() {
