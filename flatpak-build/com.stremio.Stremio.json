@@ -30,6 +30,9 @@
         "--device=all",
         "--device=dri",
         "--persist=.stremio-server",
+        "--persist=.local",
+        "--persist=.cache",
+        "--persist=.config",
         "--filesystem=xdg-download",
         "--filesystem=xdg-run/stremio:create",
         "--filesystem=xdg-run/pipewire-0:ro",
@@ -54,7 +57,7 @@
                 }
             },
             "build-commands": [
-                "cat tv-mpv-bridge.js >> src/app/ipc/preload.js",
+                "printf '\\n;\\n' >> src/app/ipc/preload.js && cat tv-mpv-bridge.js >> src/app/ipc/preload.js",
                 "cargo --offline fetch --manifest-path Cargo.toml --verbose",
                 "cargo --offline build --release --verbose -F offline-build"
             ],
@@ -63,6 +66,8 @@
                 "install -Dm644 data/server.js -t /app/libexec/stremio",
                 "install -Dm755 stremio-tv.sh /app/bin/stremio",
                 "install -Dm644 tv-mpv-bridge.js /app/libexec/stremio/tv-mpv-bridge.js",
+                "install -Dm755 tv-ui-server.js /app/libexec/stremio/tv-ui-server.js",
+                "mkdir -p /app/share/stremio-tv-web && cp -r stremio-tv-web/. /app/share/stremio-tv-web/",
                 "install -Dm644 data/icons/com.stremio.Stremio.svg -t /app/share/icons/hicolor/scalable/apps/",
                 "install -Dm644 data/com.stremio.Stremio.desktop -t /app/share/applications/",
                 "install -Dm644 com.stremio.Stremio.metainfo.xml -t /app/share/metainfo/",
@@ -93,6 +98,15 @@
                 {
                     "type": "file",
                     "path": "tv-mpv-bridge.js"
+                },
+                {
+                    "type": "file",
+                    "path": "tv-ui-server.js"
+                },
+                {
+                    "type": "dir",
+                    "path": "stremio-tv-web",
+                    "dest": "stremio-tv-web"
                 },
                 "cargo-sources.json"
             ],

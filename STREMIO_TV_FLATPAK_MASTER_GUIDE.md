@@ -1,126 +1,76 @@
-# Stremio Android TV to Linux Bazzite Flatpak — Master Deployment & REA Guide (v1.0)
+# Stremio Android TV to Linux Bazzite Flatpak — Master Deployment & REA Guide (v2.0)
 
 ## 1. Architectural Overview & Objective
-This guide documents the complete reverse-engineering and packaging workflow to bridge the Stremio 10-foot Android TV Web interface (`tv.strem.io`) into a native Linux Flatpak (`stremio-linux-shell`) running on Bazzite / SteamOS.
+This guide documents the complete reverse-engineering and packaging workflow to bridge the Stremio 10-foot Smart TV Web interface (`tv.strem.io`) into a native Linux Flatpak (`stremio-linux-shell`) running on Bazzite / SteamOS.
 
 Instead of running bytecode via Waydroid (which lacks the Android TV Leanback framework and MediaCodec hardware acceleration bindings), this project packages:
-* **The Application Shell:** `stremio-linux-shell` (Rust + GTK4 + WebKitGTK 6.0 + `libmpv`) built with native VA-API & Wayland support.
-* **The UI Layer:** Stremio Theater Web UI (`tv.strem.io`) loaded via local streaming proxy.
-* **The IPC & Gamepad/HID Bridge (`tv-mpv-bridge.js`):** Intercepts WebKitGTK IPC messages, mocks Qt WebChannel transport, drops malformed Web-MPV property setters, maps 2.4GHz USB HID remotes / gamepads to spatial navigation keys, and routes playback requests directly to native hardware-accelerated `libmpv`.
+* **The Application Shell:** `stremio-linux-shell` v1.2.2 (Rust + GTK4 + WebKitGTK 6.0 + `libmpv`) built with native VA-API (`radeonsi` on AMD GPUs) & Wayland support.
+* **The Offline UI Layer (`tv-ui-server.js` + `stremio-tv-web/`):** All 40 static assets of `tv.strem.io` are bundled inside `/app/share/stremio-tv-web` and served from `http://127.0.0.1:11471/` with an online read-through cache and atomic disk-backed `localStorage` persistence (`$XDG_DATA_HOME/stremio-tv-storage.json`).
+* **The Two-Way IPC, M5 BT Remote & Gamepad Bridge (`tv-mpv-bridge.js`):** Handles the bidirectional `window.qt.webChannelTransport.onmessage` protocol with `src/app/ipc/preload.js`, mounts `ShellTransport` via a scoped `Object.prototype.shellTransport` getter/setter, suppresses `tv.strem.io`'s duplicate internal gamepad poller, provides a 60Hz `COOLDOWN_MS = 180` Gamepad poller, and maps the **M5 BT English (2.4GHz + BT 5.0 + 6-Axis Air-Mouse + Rear Mini QWERTY Keyboard)** remote control directly to `tv.strem.io` spatial navigation and `libmpv` volume controls.
 
 ---
 
 ## 2. Project Directory Structure
 ```text
 stremio-bazzite-tv/
-├── Stremio-android-tv/          # Unpacked Android TV APK bundle components (not committed)
-│   ├── base.apk
-│   └── split_config.arm64_v8a.apk
-├── Stremio-flatpak/             # Official Flatpak reference files (not committed)
-│   └── com.stremio.Stremio.flatpakref
-├── flatpak-build/               # Flatpak manifest, launcher, and bridge scripts
-│   ├── com.stremio.Stremio.json
-│   ├── build-and-install.sh
+├── flatpak-build/               # Flatpak manifest, offline assets, launcher, and bridge scripts
+│   ├── com.stremio.Stremio.json # Flatpak Builder manifest with offline UI + persistent dirs
+│   ├── build-and-install.sh     # Pre-build backup extractor + offline bundler + installer
+│   ├── bundle-tv-web.py         # Recursive tv.strem.io asset downloader
+│   ├── bundle-tv-web.sh         # Shell wrapper for offline asset bundling
+│   ├── stremio-tv-web/          # Bundled offline tv.strem.io assets (40 files)
+│   ├── stremio-tv.sh            # Main Flatpak entrypoint (server.js + tv-ui-server.js + shell)
+│   ├── tv-ui-server.js          # Local offline HTTP server + localStorage disk persistence
+│   └── tv-mpv-bridge.js         # Two-way IPC, libmpv bridge, Gamepad & M5 BT remote driver
+├── patches/                     # Reference copies of runtime patches
 │   ├── stremio-tv.sh
-│   └── tv-mpv-bridge.js
-├── patches/                     # Applied source and runtime patches
-│   ├── stremio-tv.sh
+│   ├── tv-ui-server.js
 │   └── tv-mpv-bridge.js
 ├── BAZZITE_TV_DEPLOYMENT_GUIDE.md
-└── STREMIO_TV_FLATPAK_MASTER_GUIDE.md
+├── STREMIO_TV_FLATPAK_MASTER_GUIDE.md
+├── TV_BRIDGE_FIX_GUIDE.md
+└── stremio_tv_bazzite_engineering_handover_report.md
 ```
 
 ---
 
 ## 3. Core Architectural Fixes & Implementations
 
-### A. Qt WebChannel Mock for WebKitGTK Compatibility
-* **Issue:** `stremio-linux-shell` uses WebKitGTK, but Stremio's web shell looks for Qt WebEngine (`window.qt.webChannelTransport`), throwing `TypeError: window.qt.webChannelTransport.onmessage is not a function`.
-* **Solution:** Mock the transport and fallback handler inside `tv-mpv-bridge.js`:
-  ```javascript
-  window.qt = window.qt || {};
-  window.qt.webChannelTransport = window.qt.webChannelTransport || {
-      onmessage: function(event) {},
-      send: function(message) {
-          if (window.ipc && typeof window.ipc.postMessage === 'function') {
-              window.ipc.postMessage(message);
-          }
-      }
-  };
-  if (typeof window.qt.webChannelTransport.onmessage !== 'function') {
-      window.qt.webChannelTransport.onmessage = function(event) {};
-  }
-  ```
+### A. Two-Way `window.qt.webChannelTransport` IPC Bridge
+* **Root Cause:** `stremio-linux-shell`'s `src/app/ipc/preload.js` defines `window.qt = { webChannelTransport: { send: ... } }` and forwards every Rust `libmpv` event (`mpv-prop-change`, `mpv-event-ended`, `visibility-change`) by calling `window.qt.webChannelTransport.onmessage({ data: message })`. Previously, defining a no-op `onmessage: function() {}` silently dropped all incoming `libmpv` playback telemetry.
+* **Fix:** `tv-mpv-bridge.js` hooks `window.qt.webChannelTransport.onmessage`, parses the JSON IPC messages from Rust (`type === 1`), and routes `args` (`["mpv-prop-change", propData]`) to `ShellTransport.emit()`. On startup, it performs the QWebChannel handshake (`{ type: 3, id: 0 }`), sends `app-ready` (`["", "1.2.2"]`), and forces fullscreen (`win-set-visibility: [{ fullscreen: true }]`).
 
-### B. MPV Property Setter Validation (`Invalid mpv-set-prop name` Fix)
-* **Issue:** The shell logs `Invalid mpv-set-prop name` / `Invalid mpv-set-prop value`.
-* **Root cause (verified against the shipped bundle and shell source):**
-  * `ShellVideo` (module `78945` in `tv-stremio-video.chunk.js`) sends `mpv-set-prop` as an **array** `[name, value]`, not an object.
-  * Its prop-name map has **no entry for `subtitlesOffset`**, so it sends `[undefined, value]`, which serializes to `[null, value]`. `src/app/ipc/request.rs` rejects that with `Invalid mpv-set-prop name`.
-  * On every stream load it also sends `["no-sub-ass"]` with no value, which is rejected with `Invalid mpv-set-prop value`.
-  * `sub-color`, `sub-back-color` and `sub-border-color` are **not** the problem. `stremio-linux-shell` v1.2.2 lists them in `STRING_PROPERTIES` (`src/app/video/config.rs`) and applies them, so filtering them would break subtitle color settings.
-* **Solution:** Validate the payload shape inside `ShellTransport.send` and drop only the malformed calls:
-  ```javascript
-  if (eventName === 'mpv-set-prop') {
-      const name = Array.isArray(args) ? args[0] : (args && args.name);
-      const hasValue = Array.isArray(args) ? args.length >= 2 : (args && 'value' in args);
-      if (typeof name !== 'string' || !hasValue) {
-          return; // drop [null, value] (subtitlesOffset) and ["no-sub-ass"]
-      }
-      if (BLOCKED_SET_PROPS.includes(name)) {
-          return; // opt-in blocklist, empty by default
-      }
-  }
-  ```
-* **Opt-in blocklist:** `BLOCKED_SET_PROPS` at the top of `tv-mpv-bridge.js` is empty by default. To reproduce the original subtitle-prop filtering, set it to `['sub-color', 'sub-back-color', 'sub-border-color', 'sub-font-size']`.
-* **Known limitation:** Because `subtitlesOffset` has no mapping in ShellVideo, the subtitle vertical-offset setting in the TV UI does nothing under the native player.
+### B. Offline Bundled `tv.strem.io` UI + Indestructible Login Persistence
+* **Root Cause of Splash Screen Hang:** Loading `tv.strem.io` via `http://127.0.0.1:11470/proxy/d=https%3A%2F%2Ftv.strem.io%2F` broke Webpack's relative publicPath calculation (`f.p = e + "../../"` in `runtime.js`), causing `core.worker.chunk.js` and WASM assets to 404 against the root of `127.0.0.1:11470`.
+* **Fix:** `tv-ui-server.js` runs on `http://127.0.0.1:11471` and serves `/app/share/stremio-tv-web` at root (`/`), keeping all relative chunk and Web Worker paths intact offline.
+* **Android TV-Style Login Persistence:** Both Flatpak sandbox persistence flags (`--persist=.stremio-server`, `--persist=.local`, `--persist=.cache`, `--persist=.config`) and an automatic `localStorage` file mirror (`$XDG_DATA_HOME/stremio-tv-storage.json`) ensure the user's Stremio account session (`profile`) and addons survive restarts and offline boots indefinitely.
 
-### C. 2.4GHz USB HID Remote Control Normalizer
-* **Issue:** Standard USB air remotes (WeChip, G10/G20, Minix, Fire TV dongles) emit consumer media keys (`BrowserBack`, `MediaPlayPause`) that web apps do not map to spatial navigation.
-* **Solution:** Global `keydown` capture listener in `tv-mpv-bridge.js` normalizes HID events into Stremio TV keyboard events:
-
-  | Remote key (`event.key`) | Normalized to |
-  |---|---|
-  | `Select` | `Enter` (13) |
-  | `BrowserBack`, `GoBack`, `Back` | `Backspace` (8) |
-  | `MediaPlayPause`, `MediaPlay`, `MediaPause` | `Space` (32) |
-  | `MediaTrackPrevious`, `MediaRewind` | `e` (69), seek back |
-  | `MediaTrackNext`, `MediaFastForward` | `h` (72), seek forward |
-  | `ContextMenu` | `Escape` (27) |
+### C. M5 BT English Remote Control & DualSense/Xbox Gamepad Support
+* **Gamepad Deduplication & Cooldown:** Intercepts `window.addEventListener('gamepadconnected')` to disable `tv.strem.io`'s built-in 100ms gamepad poller (module `60715`) and replaces it with a single 60Hz `requestAnimationFrame` poller with `COOLDOWN_MS = 180` and accurate `tv.strem.io` keyCodes (`412` Rewind, `417` Fast-Forward, `32` Play/Pause, `27` Back, `13` Enter).
+* **M5 BT Remote Control Support:**
+  * **Air-Mouse Right-Click (`contextmenu`):** Suppressed browser menu and mapped to Back (`Escape`, `keyCode: 27`).
+  * **Air-Mouse Left-Click on `<input>`:** Explicitly focuses `<input>` / `<textarea>` elements for typing.
+  * **Rear Mini QWERTY Keyboard Protection:** Prevents `tv.strem.io` from hijacking letter keys (`e`, `g`, `h`, `j`, `x`) and `Backspace` as navigation shortcuts while an `<input>` is focused.
+  * **Hardware Volume Keys (`AudioVolumeUp` / `AudioVolumeDown` / `AudioVolumeMute`):** Adjust `libmpv` volume directly (`mpv-set-prop` `volume` / `mute`).
 
 ---
 
 ## 4. Step-by-Step Build and Deployment Instructions (Bazzite / SteamOS)
 
-1. **Clone or Pull the Repository on Bazzite:**
+1. **Pull the Latest Changes on Bazzite:**
    ```bash
-   git clone https://github.com/GonzaloMejia/stremio-bazzite-tv.git ~/stremio-bazzite-tv  # first time
    cd ~/stremio-bazzite-tv
    git pull origin main
    ```
 
-2. **`flatpak-builder` availability (automatic):**
-   `build-and-install.sh` uses the host `flatpak-builder` if present. Otherwise it installs and uses the Flathub-packaged `org.flatpak.Builder` (`flatpak run org.flatpak.Builder ...`). No manual step is needed.
-   If you want a `flatpak-builder` command on PATH anyway:
+2. **Build and Install the Flatpak:**
    ```bash
-   flatpak install --user -y flathub org.flatpak.Builder
-   mkdir -p ~/.local/bin
-   cat << 'EOF' > ~/.local/bin/flatpak-builder
-   #!/usr/bin/env bash
-   exec flatpak run org.flatpak.Builder "$@"
-   EOF
-   chmod +x ~/.local/bin/flatpak-builder
-   export PATH="$HOME/.local/bin:$PATH"
-   ```
-
-3. **Run the Installer Script:**
-   ```bash
-   chmod +x build-and-install.sh flatpak-build/*.sh
+   cd ~/stremio-bazzite-tv/flatpak-build
+   chmod +x *.sh
    ./build-and-install.sh
    ```
 
-4. **Launch in 10-Foot TV Mode:**
+3. **Launch in 10-Foot TV Mode:**
    ```bash
-   flatpak run com.stremio.Stremio                              # default: tv.strem.io via local proxy
-   flatpak run com.stremio.Stremio --url="https://tv.strem.io"  # direct, overrides the default
+   flatpak run com.stremio.Stremio
    ```
