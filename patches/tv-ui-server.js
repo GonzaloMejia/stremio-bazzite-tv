@@ -1,217 +1,102 @@
 #!/usr/bin/env node
-/**
- * Stremio TV Local Offline-First UI Server & Persistent Storage Mirror
- * Runs on http://127.0.0.1:11471 inside the Flatpak sandbox.
- *
- * 1. Serves offline-bundled tv.strem.io assets from /app/share/stremio-tv-web/
- * 2. Read-through caches any missing assets from https://tv.strem.io into
- *    $XDG_DATA_HOME/stremio-tv-web-cache/ so subsequent launches are 100% offline.
- * 3. Persists localStorage (auth token, profile, library, settings) to disk at
- *    $XDG_DATA_HOME/stremio-tv-storage.json and injects it into index.html on boot.
- */
 'use strict';
-
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
-
+const http = require('http'), fs = require('fs'), path = require('path');
 const PORT = parseInt(process.env.STREMIO_TV_UI_PORT || '11471', 10);
 const HOST = '127.0.0.1';
-const BUNDLE_DIR = process.env.STREMIO_TV_BUNDLE_DIR || '/app/share/stremio-tv-web';
-const DATA_DIR = process.env.XDG_DATA_HOME || path.join(process.env.HOME || '/tmp', '.local/share');
-const CACHE_DIR = path.join(DATA_DIR, 'stremio-tv-web-cache');
-const STORAGE_FILE = path.join(DATA_DIR, 'stremio-tv-storage.json');
-const UPSTREAM_ORIGIN = 'https://tv.strem.io';
+const WEB_ROOT = process.env.STREMIO_TV_BUNDLE_DIR || '/app/share/stremio-tv-web';
+const sseClients = [];
+const keyDebounce = new Map();
 
-try {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-} catch (e) {}
+process.on('uncaughtException', (err) => console.error('[Stremio TV UI Server] Uncaught exception:', err.message));
 
-const MIME_TYPES = {
-    '.html': 'text/html; charset=utf-8',
-    '.js': 'application/javascript; charset=utf-8',
-    '.mjs': 'application/javascript; charset=utf-8',
-    '.css': 'text/css; charset=utf-8',
-    '.wasm': 'application/wasm',
-    '.json': 'application/json; charset=utf-8',
-    '.svg': 'image/svg+xml',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.ico': 'image/x-icon',
-    '.ttf': 'font/ttf',
-    '.otf': 'font/otf',
-    '.woff': 'font/woff',
-    '.woff2': 'font/woff2'
-};
-
-function getMimeType(filePath) {
-    const ext = path.extname(filePath).toLowerCase();
-    return MIME_TYPES[ext] || 'application/octet-stream';
+function emitGamepadKey(key, code, keyCode, src) {
+    const now = Date.now();
+    if ((keyDebounce.get(keyCode) || 0) + 110 > now) return;
+    keyDebounce.set(keyCode, now);
+    console.log(`[Stremio TV Gamepad] ${key} (${src})`);
+    const data = `data: ${JSON.stringify({ key, code, keyCode })}\n\n`;
+    sseClients.forEach(c => c.write(data));
 }
 
-function readPersistedStorage() {
-    try {
-        if (fs.existsSync(STORAGE_FILE)) {
-            return JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-        }
-    } catch (e) {
-        console.error('[Stremio TV UI Server] Failed to read storage file:', e.message);
-    }
-    return {};
-}
-
-function writePersistedStorage(data) {
-    try {
-        const current = readPersistedStorage();
-        const merged = Object.assign({}, current, data);
-        const finalData = Object.keys(data).length === 0 ? {} : merged;
-        const tmpFile = STORAGE_FILE + '.tmp';
-        fs.writeFileSync(tmpFile, JSON.stringify(finalData, null, 2), 'utf8');
-        fs.renameSync(tmpFile, STORAGE_FILE);
-    } catch (e) {
-        console.error('[Stremio TV UI Server] Failed to write storage file:', e.message);
-    }
-}
-
-function injectBootstrapIntoHtml(htmlBuffer) {
-    let html = htmlBuffer.toString('utf8');
-    html = html.replace(/https:\/\/tv\.strem\.io\//g, '/');
-
-    const storageSnapshot = JSON.stringify(readPersistedStorage());
-    const bootstrapScript = `<script>
-window.__INITIAL_STREMIO_STORAGE__ = ${storageSnapshot};
-try {
-    for (const [k, v] of Object.entries(window.__INITIAL_STREMIO_STORAGE__)) {
-        if (typeof v === 'string' && window.localStorage.getItem(k) === null) {
-            window.localStorage.setItem(k, v);
-        }
-    }
-} catch (e) {}
-window.loadedApp = window.loadedApp || function() {};
-</script>`;
-
-    if (html.includes('<head>')) {
-        html = html.replace('<head>', '<head>\n' + bootstrapScript);
-    } else {
-        html = bootstrapScript + '\n' + html;
-    }
-    return Buffer.from(html, 'utf8');
-}
-
-function fetchFromUpstream(urlPath) {
-    return new Promise((resolve, reject) => {
-        const targetUrl = UPSTREAM_ORIGIN + (urlPath.startsWith('/') ? urlPath : '/' + urlPath);
-        const req = https.get(targetUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
-            },
-            timeout: 15000
-        }, (res) => {
-            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                fetchFromUpstream(res.headers.location).then(resolve).catch(reject);
-                return;
+function processEventBuffer(buf, src) {
+    for (let i = 0; i + 24 <= buf.length; i += 24) {
+        const type = buf.readUInt16LE(i + 16), code = buf.readUInt16LE(i + 18), val = buf.readInt32LE(i + 20);
+        if (type === 3) {
+            if (code === 16) emitGamepadKey(val < 0 ? 'ArrowLeft' : 'ArrowRight', 'Arrow', val < 0 ? 37 : 39, src);
+            if (code === 17) emitGamepadKey(val < 0 ? 'ArrowUp' : 'ArrowDown', 'Arrow', val < 0 ? 38 : 40, src);
+        } else if (type === 1 && (val === 1 || val === 2)) {
+            const map = { 544: [38, 'ArrowUp'], 706: [38, 'ArrowUp'], 103: [38, 'ArrowUp'], 545: [40, 'ArrowDown'], 707: [40, 'ArrowDown'], 108: [40, 'ArrowDown'], 546: [37, 'ArrowLeft'], 704: [37, 'ArrowLeft'], 105: [37, 'ArrowLeft'], 547: [39, 'ArrowRight'], 705: [39, 'ArrowRight'], 106: [39, 'ArrowRight'] };
+            if (map[code]) emitGamepadKey(map[code][1], map[code][1], map[code][0], src);
+            else if (val === 1) {
+                const btnMap = { 304: [13, 'Enter'], 305: [27, 'Escape'], 307: [32, ' '], 308: [83, 's'], 314: [27, 'Escape'], 158: [27, 'Escape'], 315: [13, 'Enter'] };
+                if (btnMap[code]) emitGamepadKey(btnMap[code][1], btnMap[code][1], btnMap[code][0], src);
             }
-            if (res.statusCode !== 200) {
-                reject(new Error(`Upstream status ${res.statusCode} for ${urlPath}`));
-                res.resume();
-                return;
-            }
-            const chunks = [];
-            res.on('data', (c) => chunks.push(c));
-            res.on('end', () => resolve({
-                buffer: Buffer.concat(chunks),
-                contentType: res.headers['content-type']
-            }));
-        });
-        req.on('error', reject);
-        req.on('timeout', () => {
-            req.destroy(new Error('Upstream timeout'));
-        });
-    });
+        }
+    }
 }
 
-const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
-    }
-
-    const parsedUrl = new URL(req.url || '/', `http://${HOST}:${PORT}`);
-    let pathname = decodeURIComponent(parsedUrl.pathname);
-
-    if (pathname === '/__stremio_storage__') {
-        if (req.method === 'GET') {
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify(readPersistedStorage()));
-            return;
-        }
-        if (req.method === 'POST') {
-            const chunks = [];
-            req.on('data', (c) => chunks.push(c));
-            req.on('end', () => {
-                try {
-                    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-                    if (body && typeof body === 'object') {
-                        writePersistedStorage(body);
-                    }
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end('{"ok":true}');
-                } catch (e) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end('{"ok":false}');
-                }
-            });
-            return;
-        }
-    }
-
-    if (pathname === '/' || pathname === '') {
-        pathname = '/index.html';
-    }
-    const safeRelPath = path.normalize(pathname).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^[/\\]+/, '');
-    const bundlePath = path.join(BUNDLE_DIR, safeRelPath);
-    const cachePath = path.join(CACHE_DIR, safeRelPath);
-
-    let fileBuffer = null;
-    if (fs.existsSync(bundlePath) && fs.statSync(bundlePath).isFile()) {
-        fileBuffer = fs.readFileSync(bundlePath);
-    } else if (fs.existsSync(cachePath) && fs.statSync(cachePath).isFile()) {
-        fileBuffer = fs.readFileSync(cachePath);
-    }
-
-    if (!fileBuffer) {
-        try {
-            const upstream = await fetchFromUpstream('/' + safeRelPath);
-            fileBuffer = upstream.buffer;
+function initGamepadReader() {
+    for (let i = 0; i < 32; i++) {
+        const dev = `/dev/input/event${i}`;
+        if (fs.existsSync(dev)) {
             try {
-                fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-                fs.writeFileSync(cachePath, fileBuffer);
-            } catch (cacheErr) {}
-        } catch (err) {
-            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end('Not found: ' + safeRelPath);
-            return;
+                const stream = fs.createReadStream(dev);
+                stream.on('data', (b) => processEventBuffer(b, dev));
+                stream.on('error', () => {});
+            } catch (e) {}
         }
     }
-
-    if (safeRelPath === 'index.html') {
-        fileBuffer = injectBootstrapIntoHtml(fileBuffer);
+    for (let i = 0; i < 4; i++) {
+        const js = `/dev/input/js${i}`;
+        if (fs.existsSync(js)) {
+            try {
+                const fd = fs.openSync(js, 'r');
+                const buf = Buffer.alloc(8);
+                setInterval(() => {
+                    while (fs.readSync(fd, buf, 0, 8, null) === 8) {
+                        const val = buf.readInt16LE(4), raw = buf.readUInt8(6), init = (raw & 0x80) !== 0, type = raw & ~0x80, num = buf.readUInt8(7);
+                        if (!init && type === 2) {
+                            if (num === 0 || num === 6) emitGamepadKey(val < -16000 ? 'ArrowLeft' : 'ArrowRight', 'Arrow', val < -16000 ? 37 : 39, js);
+                            if (num === 1 || num === 7) emitGamepadKey(val < -16000 ? 'ArrowUp' : 'ArrowDown', 'Arrow', val < -16000 ? 38 : 40, js);
+                        } else if (!init && type === 1 && val === 1) {
+                            const map = { 12: [38, 'ArrowUp'], 13: [40, 'ArrowDown'], 14: [37, 'ArrowLeft'], 15: [39, 'ArrowRight'], 0: [13, 'Enter'], 1: [27, 'Escape'], 2: [32, ' '], 3: [83, 's'], 6: [27, 'Escape'], 8: [27, 'Escape'], 7: [13, 'Enter'], 9: [13, 'Enter'] };
+                            if (map[num]) emitGamepadKey(map[num][1], map[num][1], map[num][0], js);
+                        }
+                    }
+                }, 50);
+            } catch (e) {}
+        }
     }
+}
+initGamepadReader(); setInterval(initGamepadReader, 3000);
 
-    res.writeHead(200, {
-        'Content-Type': getMimeType(safeRelPath),
-        'Cache-Control': safeRelPath === 'index.html' ? 'no-cache' : 'public, max-age=31536000'
-    });
-    res.end(fileBuffer);
-});
+const MIME = {'.html': 'text/html; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8'};
+const server = http.createServer((req, res) => {
+    try {
+        const parsedUrl = new URL(req.url, `http://${HOST}:${PORT}`);
+        const pathname = decodeURIComponent(parsedUrl.pathname);
 
-server.listen(PORT, HOST, () => {
-    console.log(`[Stremio TV UI Server] Serving offline-first TV UI on http://${HOST}:${PORT}`);
+        if (pathname === '/__log') { console.log(`[Stremio TV Bridge] ${parsedUrl.searchParams.get('msg')}`); res.writeHead(200); res.end(); return; }
+        if (pathname === '/__gamepad_stream') {
+            res.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive'});
+            sseClients.push(res); req.on('close', () => sseClients.splice(sseClients.indexOf(res), 1));
+            return;
+        }
+        if (pathname === '/__quit') { process.exit(0); }
+
+        let p = pathname === '/' ? '/index.html' : pathname;
+        let filePath = path.join(WEB_ROOT, path.normalize(p).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^[/\\]+/, ''));
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) filePath = path.join(filePath, 'index.html');
+        
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+            res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+            res.end(fs.readFileSync(filePath));
+        } else {
+            res.writeHead(404); res.end('Not found');
+        }
+    } catch (err) {
+        console.error('[Stremio TV UI Server] Request error:', err.message);
+        if (!res.headersSent) { res.writeHead(500); res.end('Internal Server Error'); }
+    }
 });
+server.listen(PORT, HOST, () => console.log(`[Stremio TV UI Server] http://${HOST}:${PORT}`));

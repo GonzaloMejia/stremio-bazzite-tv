@@ -1,97 +1,63 @@
 /**
- * Stremio TV <-> Linux Shell Native MPV, M5 BT Remote & Gamepad Bridge
+ * Stremio TV <-> Linux Shell Native MPV & Gamepad Bridge
  */
+(function initQtTransport() {
+  window.qt = window.qt || {};
+  const transport = window.qt.webChannelTransport || {};
+  window.qt.webChannelTransport = transport;
+
+  let appOnMessage = typeof transport.onmessage === 'function' ? transport.onmessage : null;
+  const inboundQueue = [];
+
+  Object.defineProperty(transport, 'onmessage', {
+    configurable: true,
+    enumerable: true,
+    get: function() {
+      return function(msg) {
+        if (typeof appOnMessage === 'function') {
+          try { return appOnMessage.call(transport, msg); } catch (e) { console.error(e); }
+        } else {
+          inboundQueue.push(msg);
+        }
+      };
+    },
+    set: function(fn) {
+      if (typeof fn === 'function') {
+        appOnMessage = fn;
+        while (inboundQueue.length > 0) {
+          const m = inboundQueue.shift();
+          try { appOnMessage.call(transport, m); } catch (e) { console.error(e); }
+        }
+      }
+    }
+  });
+})();
+
 ;(function() {
     'use strict';
     if (window.__STREMIO_TV_BRIDGE_INITIALIZED__) return;
     window.__STREMIO_TV_BRIDGE_INITIALIZED__ = true;
 
-    // Beacon
     fetch('http://127.0.0.1:11471/__log?msg=bridge-loaded').catch(() => {});
-    console.log("[Stremio TV Bridge] Bridge loading...");
 
-    // =========================================================================
-    // 0. Robust & Safe Async IPC Interception
-    // =========================================================================
-    let pendingMessages = [];
-    let transport = null;
-
-    // Use a persistent getter/proxy for window.qt and window.qt.webChannelTransport
-    Object.defineProperty(window, 'qt', {
-        configurable: true,
-        get() { return this._qt || (this._qt = {}); },
-        set(val) { this._qt = val; }
-    });
-
-    // Poller to safely attach to the transport when it appears
-    const monitorInterval = setInterval(() => {
-        if (window.qt && window.qt.webChannelTransport) {
-            transport = window.qt.webChannelTransport;
-            clearInterval(monitorInterval);
-            console.log("[Bridge] Qt transport found.");
-            
-            // Hook onmessage if it exists
-            if (typeof transport.onmessage === 'function') {
-                const originalOnMessage = transport.onmessage;
-                transport.onmessage = function(msg) {
-                    try { return originalOnMessage.apply(this, arguments); } catch (e) { console.error(e); }
-                };
-            }
-            flushQueue();
-        }
-    }, 10);
-
-    const originalPostMessage = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) ? window.webkit.messageHandlers.ipc.postMessage.bind(window.webkit.messageHandlers.ipc) : null;
-
-    function flushQueue() {
-        while (pendingMessages.length > 0) interceptAndSend(pendingMessages.shift());
-    }
-
+    // IPC Helper
     function interceptAndSend(message) {
         try {
-            // IPC Filtering logic
-            let parsed = typeof message === 'string' ? JSON.parse(message) : message;
-            if (parsed && parsed.type === 6 && Array.isArray(parsed.args)) {
-                const [eventName, args] = parsed.args;
-                if (eventName === 'app-ready') return;
-                if (eventName === 'mpv-set-prop' && Array.isArray(args)) {
-                    if (['sub-color', 'sub-back-color', 'sub-border-color'].includes(args[0])) args[1] = formatMpvColor(args[1]);
-                    if (args[1] === null || args[1] === undefined) return;
-                }
-                if (eventName === 'mpv-observe-prop' && ['input-default-bindings'].includes(Array.isArray(args) ? args[0] : args)) return;
-            }
-
-            if (originalPostMessage) {
-                originalPostMessage(typeof message === 'string' ? message : JSON.stringify(message));
-            } else if (transport && typeof transport.send === 'function') {
-                transport.send(message);
-            } else {
-                pendingMessages.push(message);
-            }
+            if (window.qt && window.qt.webChannelTransport) window.qt.webChannelTransport.send(message);
+            else if (window.ipc) window.ipc.postMessage(typeof message === 'string' ? message : JSON.stringify(message));
         } catch (e) { console.error("[Bridge] IPC Error:", e); }
     }
 
-    // =========================================================================
-    // 1. Color Normalization
-    // =========================================================================
-    function formatMpvColor(val) {
-        if (typeof val !== 'string') return val;
-        val = val.trim();
-        return (val.startsWith('#') && val.length === 9) ? '#' + val.slice(1, 7) : val;
-    }
-
-    // =========================================================================
-    // 2. Subtitle Raising Manager
-    // =========================================================================
+    // Subtitle Raising
     try {
         const style = document.createElement('style');
         style.textContent = `
             body.stremio-controls-visible [class*="subtitle-container"],
-            body.stremio-controls-visible [class*="subtitles-container"],
-            body.stremio-controls-visible .subtitles {
+            body.stremio-controls-visible .stremio-video-subtitles {
                 bottom: 150px !important;
                 transform: translateY(-130px) !important;
                 position: absolute !important;
+                transition: transform 0.2s ease !important;
             }
         `;
         document.head.appendChild(style);
@@ -111,57 +77,57 @@
         ['mousemove', 'pointerdown', 'keydown', 'wheel'].forEach(evt => window.addEventListener(evt, check, true));
     } catch(e) {}
 
-    // =========================================================================
-    // 3. Gamepad Manager (8BitDo)
-    // =========================================================================
-    class GamepadManager {
-        constructor() { setInterval(() => this.poll(), 50); this.lastAxis = 0; this.btnStates = {}; }
-        poll() {
-            const gp = navigator.getGamepads()[0];
-            if (!gp) return;
-            const now = Date.now();
-            if (now - this.lastAxis > 150) {
-                const dpad = [gp.buttons[12], gp.buttons[13], gp.buttons[14], gp.buttons[15]];
-                // Map buttons 12-15 AND axes 6-7 (hats)
-                const up = dpad[0].pressed || gp.axes[1] < -0.4 || gp.axes[7] < -0.4;
-                const down = dpad[1].pressed || gp.axes[1] > 0.4 || gp.axes[7] > 0.4;
-                const left = dpad[2].pressed || gp.axes[0] < -0.4 || gp.axes[6] < -0.4;
-                const right = dpad[3].pressed || gp.axes[0] > 0.4 || gp.axes[6] > 0.4;
-                
-                if (up) { this.dispatch(38, 'ArrowUp'); this.lastAxis = now; }
-                else if (down) { this.dispatch(40, 'ArrowDown'); this.lastAxis = now; }
-                else if (left) { this.dispatch(37, 'ArrowLeft'); this.lastAxis = now; }
-                else if (right) { this.dispatch(39, 'ArrowRight'); this.lastAxis = now; }
-            }
-            const map = { 0: [13, 'Enter'], 1: [27, 'Escape'], 2: [32, ' '], 3: [83, 's'], 8: [27, 'Escape'], 9: [27, 'Escape'] };
-            for(const b in map) {
-                if(gp.buttons[b] && gp.buttons[b].pressed && !this.btnStates[b]) this.dispatch(map[b][0], map[b][1]);
-                if(gp.buttons[b]) this.btnStates[b] = gp.buttons[b].pressed;
-            }
-        }
-        dispatch(c, k) {
-            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { keyCode: c, key: k, bubbles: true }));
-            document.activeElement.dispatchEvent(new KeyboardEvent('keyup', { keyCode: c, key: k, bubbles: true }));
-        }
+    // Input Fixes
+    function dispatchSyntheticKey(key, code, keyCode) {
+        const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document;
+        target.dispatchEvent(new KeyboardEvent('keydown', { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new KeyboardEvent('keyup', { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true }));
     }
-    new GamepadManager();
 
-    // =========================================================================
-    // 4. Input Fixes
-    // =========================================================================
-    window.addEventListener('pointerup', (e) => {
-        if (e.target) {
-            e.target.focus();
-            const d = new KeyboardEvent('keydown', { keyCode: 13, key: 'Enter', bubbles: true });
-            const u = new KeyboardEvent('keyup', { keyCode: 13, key: 'Enter', bubbles: true });
-            e.target.dispatchEvent(d); e.target.dispatchEvent(u);
+    const FOCUSABLE_SELECTOR = '[tabindex]:not([tabindex="-1"]), a[href], button, input, select, [role="button"], [class*="tile"], [class*="poster"], [class*="item-container"], [class*="option"], [class*="button-container"], [class*="control"]';
+    function findFocusableTile(el) { return el ? (el.closest('[tabindex]') || el.closest(FOCUSABLE_SELECTOR)) : null; }
+
+    window.addEventListener('mousemove', (e) => {
+        document.documentElement.style.cursor = 'auto';
+        const hit = document.elementFromPoint(e.clientX, e.clientY);
+        const focusTarget = findFocusableTile(hit);
+        if (focusTarget && focusTarget !== document.activeElement) focusTarget.focus({ preventScroll: true });
+    }, true);
+
+    window.addEventListener('mousedown', (e) => {
+        if (e.button === 0) {
+            const focusTarget = findFocusableTile(e.target);
+            if (focusTarget) focusTarget.focus({ preventScroll: true });
         }
     }, true);
+
+    window.addEventListener('click', (e) => {
+        if (!e.isTrusted) return;
+        const target = findFocusableTile(e.target);
+        if (target) {
+            target.focus({ preventScroll: true });
+            setTimeout(() => dispatchSyntheticKey('Enter', 'Enter', 13), 40);
+        }
+    }, true);
+
+    window.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        dispatchSyntheticKey('Escape', 'Escape', 27);
+        setTimeout(() => window.history.back(), 50);
+    }, true);
+
     window.addEventListener('keydown', (e) => {
-        if (['BrowserBack', 'XF86Back', 'GoBack', 'Backspace'].includes(e.key)) {
+        if (['BrowserBack', 'XF86Back', 'GoBack', 'Backspace', 'Escape'].includes(e.key)) {
             e.preventDefault();
             window.history.back();
         }
     }, true);
+
+    // Gamepad SSE Receiver
+    const sse = new EventSource('http://127.0.0.1:11471/__gamepad_stream');
+    sse.onmessage = (e) => {
+        const { key, keyCode } = JSON.parse(e.data);
+        dispatchSyntheticKey(key, key, keyCode);
+    };
 
 })();
