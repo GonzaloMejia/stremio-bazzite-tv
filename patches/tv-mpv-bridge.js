@@ -1,90 +1,131 @@
 /**
  * Stremio TV <-> Linux Shell Native MPV & Gamepad Bridge
+ * Injected into WebKitGTK at start (preload) for tv.strem.io
  */
-(function initQtTransport() {
-  window.qt = window.qt || {};
-  const transport = window.qt.webChannelTransport || {};
-  window.qt.webChannelTransport = transport;
+(function() {
+    console.log("[Stremio TV Bridge] Initializing TV Shell Native MPV & Gamepad Bridge...");
 
-  let appOnMessage = typeof transport.onmessage === 'function' ? transport.onmessage : null;
-  const inboundQueue = [];
-
-  Object.defineProperty(transport, 'onmessage', {
-    configurable: true,
-    enumerable: true,
-    get: function() {
-      return function(msg) {
-        if (typeof appOnMessage === 'function') {
-          try { return appOnMessage.call(transport, msg); } catch (e) { console.error(e); }
-        } else {
-          inboundQueue.push(msg);
+    // Mock Qt WebChannel transport for WebKitGTK compatibility
+    window.qt = window.qt || {};
+    window.qt.webChannelTransport = window.qt.webChannelTransport || {
+        onmessage: function(event) {},
+        send: function(message) {
+            if (window.ipc && typeof window.ipc.postMessage === 'function') {
+                window.ipc.postMessage(message);
+            } else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
+                window.webkit.messageHandlers.ipc.postMessage(message);
+            }
         }
-      };
-    },
-    set: function(fn) {
-      if (typeof fn === 'function') {
-        appOnMessage = fn;
-        while (inboundQueue.length > 0) {
-          const m = inboundQueue.shift();
-          try { appOnMessage.call(transport, m); } catch (e) { console.error(e); }
-        }
-      }
-    }
-  });
-})();
-
-;(function() {
-    'use strict';
-    if (window.__STREMIO_TV_BRIDGE_INITIALIZED__) return;
-    window.__STREMIO_TV_BRIDGE_INITIALIZED__ = true;
-
-    fetch('http://127.0.0.1:11471/__log?msg=bridge-loaded').catch(() => {});
-
-    // IPC Helper
-    function interceptAndSend(message) {
-        try {
-            if (window.qt && window.qt.webChannelTransport) window.qt.webChannelTransport.send(message);
-            else if (window.ipc) window.ipc.postMessage(typeof message === 'string' ? message : JSON.stringify(message));
-        } catch (e) { console.error("[Bridge] IPC Error:", e); }
+    };
+    if (typeof window.qt.webChannelTransport.onmessage !== 'function') {
+        window.qt.webChannelTransport.onmessage = function(event) {};
     }
 
-    // Subtitle Raising
-    try {
-        const style = document.createElement('style');
-        style.textContent = `
-            body.stremio-controls-visible [class*="subtitle-container"],
-            body.stremio-controls-visible .stremio-video-subtitles {
-                bottom: 150px !important;
-                transform: translateY(-130px) !important;
-                position: absolute !important;
-                transition: transform 0.2s ease !important;
-            }
-        `;
-        document.head.appendChild(style);
-        
-        let isControlsVisible = false;
-        const check = () => {
-            if (!window.location.hash.startsWith('#/player')) return;
-            const controls = document.querySelector('[class*="control-bar-container"]');
-            const visible = controls && controls.offsetWidth > 0 && controls.offsetHeight > 0 && getComputedStyle(controls).opacity !== '0';
-            if (visible !== isControlsVisible) {
-                isControlsVisible = visible;
-                document.body.classList.toggle('stremio-controls-visible', visible);
-                interceptAndSend({type: 6, args: ['mpv-set-prop', ['sub-pos', visible ? 75 : 100]]});
-            }
-        };
-        new MutationObserver(check).observe(document.body, { attributes: true, subtree: true });
-        ['mousemove', 'pointerdown', 'keydown', 'wheel'].forEach(evt => window.addEventListener(evt, check, true));
-    } catch(e) {}
+    const BLOCKED_SET_PROPS = [];
 
-    // Input Fixes
+    // 1. Native MPV ShellTransport Bridge
+    class ShellTransport {
+        constructor() {
+            this.listeners = {};
+            this.initIpcListener();
+        }
+
+        initIpcListener() {
+            const handleMessage = (event) => {
+                try {
+                    let msg = event.data;
+                    if (typeof msg === 'string') {
+                        msg = JSON.parse(msg);
+                    }
+                    if (msg && Array.isArray(msg.args)) {
+                        const [eventName, data] = msg.args;
+                        this.emit(eventName, data);
+                    }
+                } catch (err) {
+                    console.error("[Stremio TV Bridge] IPC message parse error:", err);
+                }
+            };
+
+            if (window.ipc && typeof window.ipc.addEventListener === 'function') {
+                window.ipc.addEventListener('message', handleMessage);
+            } else {
+                window.addEventListener('message', handleMessage);
+            }
+        }
+
+        send(eventName, args) {
+            const payload = JSON.stringify({
+                type: 6,
+                args: [eventName, args]
+            });
+            if (window.ipc && typeof window.ipc.postMessage === 'function') {
+                window.ipc.postMessage(payload);
+            } else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
+                window.webkit.messageHandlers.ipc.postMessage(payload);
+            } else {
+                console.warn("[Stremio TV Bridge] IPC channel unavailable for send:", eventName);
+            }
+        }
+
+        on(eventName, callback) {
+            if (!this.listeners[eventName]) this.listeners[eventName] = [];
+            this.listeners[eventName].push(callback);
+        }
+
+        emit(eventName, data) {
+            if (this.listeners[eventName]) {
+                this.listeners[eventName].forEach(cb => {
+                    try { cb(data); } catch (e) { console.error(e); }
+                });
+            }
+        }
+    }
+
+    const shellTransportInstance = new ShellTransport();
+    window.shellTransport = shellTransportInstance;
+    window.stremio_server_ipc_key = "LINUX";
+
+    // 2. Subtitle Raising & Input Helper
     function dispatchSyntheticKey(key, code, keyCode) {
         const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document;
         target.dispatchEvent(new KeyboardEvent('keydown', { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true }));
         target.dispatchEvent(new KeyboardEvent('keyup', { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true }));
     }
 
+    class SubtitleRaisingManager {
+        constructor() {
+            this.init();
+        }
+        init() {
+            const style = document.createElement('style');
+            style.textContent = `
+                html, body, #app { background: transparent !important; }
+                body.stremio-controls-visible [class*="subtitle-container"],
+                body.stremio-controls-visible .stremio-video-subtitles {
+                    bottom: 150px !important;
+                    transform: translateY(-130px) !important;
+                    position: absolute !important;
+                    transition: transform 0.2s ease !important;
+                }
+            `;
+            document.head.appendChild(style);
+            
+            const check = () => {
+                if (!window.location.hash.startsWith('#/player')) return;
+                const controls = document.querySelector('[class*="control-bar-container"]');
+                const visible = controls && controls.offsetWidth > 0 && controls.offsetHeight > 0 && getComputedStyle(controls).opacity !== '0';
+                document.body.classList.toggle('stremio-controls-visible', visible);
+                shellTransportInstance.send('mpv-set-prop', ['sub-pos', visible ? 75 : 100]);
+            };
+            new MutationObserver(check).observe(document.body, { attributes: true, subtree: true });
+            ['mousemove', 'pointerdown', 'keydown', 'wheel'].forEach(evt => window.addEventListener(evt, check, true));
+        }
+    }
+    new SubtitleRaisingManager();
+
+    // 3. Mouse & Spatial Navigation Fixes
     const FOCUSABLE_SELECTOR = '[tabindex]:not([tabindex="-1"]), a[href], button, input, select, [role="button"], [class*="tile"], [class*="poster"], [class*="item-container"], [class*="option"], [class*="button-container"], [class*="control"]';
+    
     function findFocusableTile(el) { return el ? (el.closest('[tabindex]') || el.closest(FOCUSABLE_SELECTOR)) : null; }
 
     window.addEventListener('mousemove', (e) => {
@@ -123,7 +164,7 @@
         }
     }, true);
 
-    // Gamepad SSE Receiver
+    // 4. Gamepad SSE Receiver
     const sse = new EventSource('http://127.0.0.1:11471/__gamepad_stream');
     sse.onmessage = (e) => {
         const { key, keyCode } = JSON.parse(e.data);
