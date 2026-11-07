@@ -23,11 +23,7 @@
             // IPC Filtering logic
             if (parsed && parsed.type === 6 && Array.isArray(parsed.args)) {
                 const [eventName, args] = parsed.args;
-
-                // Robustness: Block specific bad methods
-                if (eventName === 'app-ready') return; // If Rust rejects
-
-                // mpv-set-prop color normalization
+                if (eventName === 'app-ready') return; 
                 if (eventName === 'mpv-set-prop' && Array.isArray(args)) {
                     const name = args[0];
                     if (['sub-color', 'sub-back-color', 'sub-border-color'].includes(name)) {
@@ -35,8 +31,6 @@
                     }
                     if (args[1] === null || args[1] === undefined) return;
                 }
-                
-                // mpv-observe-prop filtering
                 if (eventName === 'mpv-observe-prop') {
                     const name = Array.isArray(args) ? args[0] : args;
                     if (['input-default-bindings'].includes(name)) return;
@@ -48,26 +42,14 @@
             } else if (window.qt && window.qt.webChannelTransport && typeof window.qt.webChannelTransport.send === 'function') {
                 window.qt.webChannelTransport.send(message);
             }
-        } catch (e) {
-            console.error("[Stremio TV Bridge] IPC Intercept Error:", e);
-        }
+        } catch (e) { console.error("[Stremio TV Bridge] IPC Intercept Error:", e); }
     }
 
-    // Hook WebKit
     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
-        Object.defineProperty(window.webkit.messageHandlers.ipc, 'postMessage', {
-            value: interceptAndSend,
-            writable: false,
-            configurable: false
-        });
+        Object.defineProperty(window.webkit.messageHandlers.ipc, 'postMessage', { value: interceptAndSend, writable: false, configurable: false });
     }
-
-    // Hook Qt
     window.qt = window.qt || {};
-    Object.defineProperty(window.qt, 'webChannelTransport', {
-        get: () => ({ send: interceptAndSend }),
-        configurable: false
-    });
+    Object.defineProperty(window.qt, 'webChannelTransport', { get: () => ({ send: interceptAndSend }), configurable: false });
 
     // =========================================================================
     // 1. Color Normalization
@@ -75,7 +57,6 @@
     function formatMpvColor(val) {
         if (typeof val !== 'string') return val;
         val = val.trim();
-        // Just strip alpha for now if it's #RRGGBBAA to #RRGGBB, libmpv v0.41 might be picky
         if (val.startsWith('#') && val.length === 9) return '#' + val.slice(1, 7);
         return val;
     }
@@ -88,7 +69,6 @@
             this.isControlsVisible = false;
             this.init();
         }
-
         init() {
             try {
                 const style = document.createElement('style');
@@ -96,33 +76,31 @@
                     body.stremio-controls-visible [class*="subtitle-container"],
                     body.stremio-controls-visible [class*="subtitles-container"],
                     body.stremio-controls-visible .subtitles {
-                        transform: translateY(-110px) !important;
+                        bottom: 150px !important;
+                        transform: translateY(-130px) !important;
+                        position: absolute !important;
                         transition: transform 0.2s ease !important;
                     }
                 `;
                 document.head.appendChild(style);
-
                 const checkControls = () => {
                     if (!window.location.hash.startsWith('#/player')) return;
                     const controls = document.querySelector('[class*="control-bar-container"]');
                     const visible = controls && controls.offsetWidth > 0 && controls.offsetHeight > 0 && getComputedStyle(controls).opacity !== '0';
-                    
                     if (visible !== this.isControlsVisible) {
                         this.isControlsVisible = visible;
                         this.updateSubtitlePosition();
                     }
                 };
-
                 new MutationObserver(checkControls).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['class', 'style'] });
                 ['mousemove', 'pointerdown', 'keydown', 'wheel'].forEach(evt => window.addEventListener(evt, checkControls, true));
-            } catch(e) { console.error("SubtitleRaisingManager init error", e); }
+            } catch(e) {}
         }
-
         updateSubtitlePosition() {
             try {
                 if (this.isControlsVisible) {
                     document.body.classList.add('stremio-controls-visible');
-                    interceptAndSend({type: 6, args: ['mpv-set-prop', ['sub-pos', 82]]});
+                    interceptAndSend({type: 6, args: ['mpv-set-prop', ['sub-pos', 75]]});
                 } else {
                     document.body.classList.remove('stremio-controls-visible');
                     interceptAndSend({type: 6, args: ['mpv-set-prop', ['sub-pos', 100]]});
@@ -138,28 +116,63 @@
     class GamepadControllerManager {
         constructor() {
             this.pollInterval = null;
+            this.buttonStates = {};
+            this.lastAxisTime = 0;
             this.init();
         }
         init() {
-            window.addEventListener('gamepadconnected', () => {
-                console.log("[Stremio TV Bridge] Gamepad connected.");
+            window.addEventListener('gamepadconnected', (e) => {
+                console.log("[Stremio TV Bridge] Gamepad connected: " + e.gamepad.id);
                 if (!this.pollInterval) this.pollInterval = setInterval(() => this.poll(), 50);
             });
         }
-        poll() {
-            const gamepads = navigator.getGamepads();
-            for (let i = 0; i < gamepads.length; i++) {
-                const gp = gamepads[i];
-                if (!gp) continue;
-                // Simplified mapping for demonstration - needs full implementation
-                if (gp.buttons[0].pressed) this.dispatchKey(13); // A
-            }
+        dispatchKey(code, key) {
+            const down = new KeyboardEvent('keydown', { keyCode: code, key: key, bubbles: true });
+            const up = new KeyboardEvent('keyup', { keyCode: code, key: key, bubbles: true });
+            document.activeElement.dispatchEvent(down);
+            document.activeElement.dispatchEvent(up);
         }
-        dispatchKey(keyCode) {
-            const evt = new KeyboardEvent('keydown', { keyCode: keyCode, bubbles: true });
-            document.dispatchEvent(evt);
+        poll() {
+            const gp = navigator.getGamepads()[0];
+            if (!gp) return;
+            const now = Date.now();
+            // D-Pad / Sticks (Debounced)
+            if (now - this.lastAxisTime > 150) {
+                if (gp.buttons[12].pressed || gp.axes[1] < -0.4) { this.dispatchKey(38, 'ArrowUp'); this.lastAxisTime = now; }
+                else if (gp.buttons[13].pressed || gp.axes[1] > 0.4) { this.dispatchKey(40, 'ArrowDown'); this.lastAxisTime = now; }
+                else if (gp.buttons[14].pressed || gp.axes[0] < -0.4) { this.dispatchKey(37, 'ArrowLeft'); this.lastAxisTime = now; }
+                else if (gp.buttons[15].pressed || gp.axes[0] > 0.4) { this.dispatchKey(39, 'ArrowRight'); this.lastAxisTime = now; }
+            }
+            // Buttons (One-shot)
+            const map = { 0: [13, 'Enter'], 1: [27, 'Escape'], 2: [32, ' '], 3: [83, 's'], 8: [27, 'Escape'], 9: [27, 'Escape'] };
+            for(const b in map) {
+                if(gp.buttons[b].pressed && !this.buttonStates[b]) {
+                    this.dispatchKey(map[b][0], map[b][1]);
+                }
+                this.buttonStates[b] = gp.buttons[b].pressed;
+            }
         }
     }
     new GamepadControllerManager();
+
+    // =========================================================================
+    // 4. Input Fixes (Mouse/Back)
+    // =========================================================================
+    window.addEventListener('pointerup', (e) => {
+        if (e.target) {
+            e.target.focus();
+            const down = new KeyboardEvent('keydown', { keyCode: 13, key: 'Enter', bubbles: true });
+            const up = new KeyboardEvent('keyup', { keyCode: 13, key: 'Enter', bubbles: true });
+            e.target.dispatchEvent(down);
+            e.target.dispatchEvent(up);
+        }
+    }, true);
+
+    window.addEventListener('keydown', (e) => {
+        if (['BrowserBack', 'XF86Back', 'GoBack', 'Backspace'].includes(e.key)) {
+            e.preventDefault();
+            window.history.back();
+        }
+    }, true);
 
 })();

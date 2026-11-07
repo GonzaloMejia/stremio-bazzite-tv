@@ -29,6 +29,7 @@
         "--share=network",
         "--device=all",
         "--device=dri",
+        "--filesystem=/run/udev:ro",
         "--persist=.stremio-server",
         "--persist=.local",
         "--persist=.cache",
