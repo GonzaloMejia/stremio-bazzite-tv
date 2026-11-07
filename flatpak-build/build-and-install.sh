@@ -12,27 +12,9 @@ echo " Building Stremio TV Flatpak (10-Foot UI + Native MPV)"
 echo " Target: Bazzite / SteamOS Game Mode"
 echo "=========================================================="
 
-# 0. Pre-build safeguard: Extract/backup pre-wipe tv-mpv-bridge.js from .flatpak-builder cache if present
-CACHED_BRIDGE=$(ls -t .flatpak-builder/build/stremio-*/tv-mpv-bridge.js 2>/dev/null | head -n 1 || true)
-if [ -n "${CACHED_BRIDGE}" ] && [ -f "${CACHED_BRIDGE}" ]; then
-    CACHED_LINES=$(wc -l < "${CACHED_BRIDGE}" || echo 0)
-    if [ "${CACHED_LINES}" -gt 50 ]; then
-        cp -f "${CACHED_BRIDGE}" "${SCRIPT_DIR}/tv-mpv-bridge.pre-wipe.bak.js"
-        echo "[+] Extracted pre-wipe tv-mpv-bridge.js backup from ${CACHED_BRIDGE} (${CACHED_LINES} lines)"
-    fi
-fi
-
-# Verify active tv-mpv-bridge.js is intact (not the 18-line stub)
-ACTIVE_LINES=$(wc -l < "${SCRIPT_DIR}/tv-mpv-bridge.js" 2>/dev/null || echo 0)
-if [ "${ACTIVE_LINES}" -lt 50 ]; then
-    if [ -f "${SCRIPT_DIR}/../patches/tv-mpv-bridge.js" ] && [ "$(wc -l < "${SCRIPT_DIR}/../patches/tv-mpv-bridge.js")" -gt 50 ]; then
-        cp -f "${SCRIPT_DIR}/../patches/tv-mpv-bridge.js" "${SCRIPT_DIR}/tv-mpv-bridge.js"
-        echo "[+] Restored full tv-mpv-bridge.js from ../patches/tv-mpv-bridge.js"
-    elif [ -f "${SCRIPT_DIR}/tv-mpv-bridge.pre-wipe.bak.js" ]; then
-        cp -f "${SCRIPT_DIR}/tv-mpv-bridge.pre-wipe.bak.js" "${SCRIPT_DIR}/tv-mpv-bridge.js"
-        echo "[+] Restored pre-wipe tv-mpv-bridge.js from cached build backup"
-    fi
-fi
+# 0. Pre-build safeguard: Forcefully use the latest patch
+cp -f "${SCRIPT_DIR}/../patches/tv-mpv-bridge.js" "${SCRIPT_DIR}/tv-mpv-bridge.js"
+echo "[+] Forcefully synced tv-mpv-bridge.js from ../patches/tv-mpv-bridge.js"
 
 # 1. Check prerequisites
 if ! command -v flatpak &>/dev/null; then
