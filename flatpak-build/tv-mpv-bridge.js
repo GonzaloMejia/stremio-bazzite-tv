@@ -8,12 +8,38 @@
 
     // Beacon
     fetch('http://127.0.0.1:11471/__log?msg=bridge-loaded').catch(() => {});
+    console.log("[Stremio TV Bridge] Bridge loading...");
 
     // =========================================================================
     // 0. Robust & Safe Async IPC Interception
     // =========================================================================
     let pendingMessages = [];
     let transport = null;
+
+    // Use a persistent getter/proxy for window.qt and window.qt.webChannelTransport
+    Object.defineProperty(window, 'qt', {
+        configurable: true,
+        get() { return this._qt || (this._qt = {}); },
+        set(val) { this._qt = val; }
+    });
+
+    // Poller to safely attach to the transport when it appears
+    const monitorInterval = setInterval(() => {
+        if (window.qt && window.qt.webChannelTransport) {
+            transport = window.qt.webChannelTransport;
+            clearInterval(monitorInterval);
+            console.log("[Bridge] Qt transport found.");
+            
+            // Hook onmessage if it exists
+            if (typeof transport.onmessage === 'function') {
+                const originalOnMessage = transport.onmessage;
+                transport.onmessage = function(msg) {
+                    try { return originalOnMessage.apply(this, arguments); } catch (e) { console.error(e); }
+                };
+            }
+            flushQueue();
+        }
+    }, 10);
 
     const originalPostMessage = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) ? window.webkit.messageHandlers.ipc.postMessage.bind(window.webkit.messageHandlers.ipc) : null;
 
@@ -44,16 +70,6 @@
             }
         } catch (e) { console.error("[Bridge] IPC Error:", e); }
     }
-
-    // Monitor for window.qt
-    const monitorInterval = setInterval(() => {
-        if (window.qt && window.qt.webChannelTransport) {
-            transport = window.qt.webChannelTransport;
-            clearInterval(monitorInterval);
-            flushQueue();
-            console.log("[Bridge] Qt transport initialized.");
-        }
-    }, 10);
 
     // =========================================================================
     // 1. Color Normalization
@@ -106,11 +122,11 @@
             const now = Date.now();
             if (now - this.lastAxis > 150) {
                 const dpad = [gp.buttons[12], gp.buttons[13], gp.buttons[14], gp.buttons[15]];
-                // Map buttons 12-15 AND axes 6-7 (hats) and axes 2-3 (sticks)
-                const up = dpad[0].pressed || gp.axes[1] < -0.4 || gp.axes[7] < -0.4 || gp.axes[3] < -0.4;
-                const down = dpad[1].pressed || gp.axes[1] > 0.4 || gp.axes[7] > 0.4 || gp.axes[3] > 0.4;
-                const left = dpad[2].pressed || gp.axes[0] < -0.4 || gp.axes[6] < -0.4 || gp.axes[2] < -0.4;
-                const right = dpad[3].pressed || gp.axes[0] > 0.4 || gp.axes[6] > 0.4 || gp.axes[2] > 0.4;
+                // Map buttons 12-15 AND axes 6-7 (hats)
+                const up = dpad[0].pressed || gp.axes[1] < -0.4 || gp.axes[7] < -0.4;
+                const down = dpad[1].pressed || gp.axes[1] > 0.4 || gp.axes[7] > 0.4;
+                const left = dpad[2].pressed || gp.axes[0] < -0.4 || gp.axes[6] < -0.4;
+                const right = dpad[3].pressed || gp.axes[0] > 0.4 || gp.axes[6] > 0.4;
                 
                 if (up) { this.dispatch(38, 'ArrowUp'); this.lastAxis = now; }
                 else if (down) { this.dispatch(40, 'ArrowDown'); this.lastAxis = now; }
