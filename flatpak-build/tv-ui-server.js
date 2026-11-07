@@ -149,7 +149,20 @@ const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url || '/', `http://${HOST}:${PORT}`);
     let pathname = decodeURIComponent(parsedUrl.pathname);
 
-    // 1. Storage Persistence Endpoint
+    // 1. Storage Persistence & Quit Endpoints
+    if (pathname === '/__quit') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end('{"ok":true}');
+        console.log('[Stremio TV UI Server] Clean quit requested. Shutting down Flatpak application...');
+        setTimeout(() => {
+            const { exec } = require('child_process');
+            exec('pkill -f /app/libexec/stremio/stremio || pkill -f stremio-linux-shell', () => {
+                process.exit(0);
+            });
+        }, 100);
+        return;
+    }
+
     if (pathname === '/__stremio_storage__') {
         if (req.method === 'GET') {
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });

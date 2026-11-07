@@ -7,12 +7,25 @@
     if (window.__STREMIO_TV_BRIDGE_INITIALIZED__) return;
     window.__STREMIO_TV_BRIDGE_INITIALIZED__ = true;
 
+    // =========================================================================
+    // 0. Immediate Synchronous Initialization (Fix Startup TypeError)
+    // =========================================================================
+    window.qt = window.qt || {};
+    window.qt.webChannelTransport = window.qt.webChannelTransport || {
+        send: function() {},
+        onmessage: function() {}
+    };
+    if (typeof window.qt.webChannelTransport.onmessage !== 'function') {
+        window.qt.webChannelTransport.onmessage = function() {};
+    }
+
     console.log("[Stremio TV Bridge] Initializing TV Shell Native MPV, M5 BT Remote & Gamepad Bridge...");
 
     // =========================================================================
-    // 0. Indestructible LocalStorage Persistence (Android TV Experience)
+    // 1. Indestructible LocalStorage Persistence (Android TV Experience)
     // =========================================================================
     const STORAGE_SYNC_URL = "http://127.0.0.1:11471/__stremio_storage__";
+    const QUIT_URL = "http://127.0.0.1:11471/__quit";
     let isRestoringStorage = false;
     let storageSyncTimer = null;
 
@@ -38,8 +51,16 @@
         }, 150);
     }
 
+    function requestCleanQuit() {
+        console.log("[Stremio TV Bridge] Clean quit requested. Posting to UI Server...");
+        try { syncStorageToDisk(); } catch (e) {}
+        fetch(QUIT_URL, { method: 'POST', keepalive: true }).catch(() => {});
+        setTimeout(() => {
+            try { window.close(); } catch (e) {}
+        }, 150);
+    }
+
     try {
-        // Restore pre-injected storage snapshot if provided by local UI server
         if (window.__INITIAL_STREMIO_STORAGE__ && typeof window.__INITIAL_STREMIO_STORAGE__ === 'object') {
             isRestoringStorage = true;
             for (const [k, v] of Object.entries(window.__INITIAL_STREMIO_STORAGE__)) {
@@ -71,7 +92,7 @@
     }
 
     // =========================================================================
-    // 1. Suppress Duplicate Internal Gamepad Poller in tv.strem.io (Module 60715)
+    // 2. Suppress Duplicate Internal Gamepad Poller in tv.strem.io (Module 60715)
     // =========================================================================
     const origWindowAddEventListener = window.addEventListener.bind(window);
     window.addEventListener = function(type, listener, options) {
@@ -84,31 +105,48 @@
     };
 
     // =========================================================================
-    // 2. Qt WebChannel Transport & Native MPV ShellTransport Bridge
+    // 3. Subtitle Color Normalization (#RRGGBBAA -> #AARRGGBB for libmpv v0.41.0)
     // =========================================================================
-    window.qt = window.qt || {};
+    function formatMpvColor(val) {
+        if (typeof val !== 'string') return val;
+        val = val.trim();
+        if (val.startsWith('#')) {
+            const hex = val.slice(1);
+            if (hex.length === 8) {
+                // RRGGBBAA -> AARRGGBB
+                const rrggbb = hex.slice(0, 6);
+                const aa = hex.slice(6, 8);
+                return '#' + aa + rrggbb;
+            } else if (hex.length === 6) {
+                return '#FF' + hex;
+            }
+        }
+        return val;
+    }
+
+    // =========================================================================
+    // 4. Qt WebChannel Transport & Native MPV ShellTransport Bridge
+    // =========================================================================
     const existingTransport = window.qt.webChannelTransport || {};
     const existingSend = typeof existingTransport.send === 'function'
         ? existingTransport.send.bind(existingTransport)
         : null;
 
     const earlyIpcQueue = [];
-    window.qt.webChannelTransport = {
-        send: function(message) {
-            if (existingSend) {
-                existingSend(message);
-            } else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
-                window.webkit.messageHandlers.ipc.postMessage(message);
-            } else if (window.ipc && typeof window.ipc.postMessage === 'function') {
-                window.ipc.postMessage(message);
-            }
-        },
-        onmessage: function(event) {
-            earlyIpcQueue.push(event);
+    window.qt.webChannelTransport.send = function(message) {
+        if (existingSend) {
+            existingSend(message);
+        } else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) {
+            window.webkit.messageHandlers.ipc.postMessage(message);
+        } else if (window.ipc && typeof window.ipc.postMessage === 'function') {
+            window.ipc.postMessage(message);
         }
     };
+    window.qt.webChannelTransport.onmessage = function(event) {
+        earlyIpcQueue.push(event);
+    };
 
-    const BLOCKED_SET_PROPS = [];
+    const BLOCKED_SET_PROPS = ['vo', 'input-defalt-bindings', 'input-default-bindings'];
 
     class ShellTransport {
         constructor() {
@@ -145,6 +183,9 @@
                             } else if (data.name === 'mute' && typeof data.data === 'boolean') {
                                 this.mpvMuted = data.data;
                             }
+                            if (window.TrackHudManager) {
+                                window.TrackHudManager.handlePropChange(data);
+                            }
                         } else if (eventName === 'mpv-event-ended') {
                             this.setMpvVisualState(false);
                         }
@@ -155,10 +196,8 @@
                 }
             };
 
-            // Wire directly to window.qt.webChannelTransport.onmessage (used by stremio-linux-shell webview.rs)
             window.qt.webChannelTransport.onmessage = handleMessage;
 
-            // Flush any messages queued before ShellTransport initialized
             while (earlyIpcQueue.length > 0) {
                 handleMessage(earlyIpcQueue.shift());
             }
@@ -171,12 +210,17 @@
         initHandshake() {
             const sendInit = () => {
                 try {
-                    // 1. QWebChannel transport initialization packet (type: 3)
                     window.qt.webChannelTransport.send(JSON.stringify({ type: 3, id: 0 }));
-                    // 2. Notify stremio-linux-shell that the web UI is ready
                     this.send('app-ready', {});
-                    // 3. Enforce fullscreen 10-foot mode
                     this.send('win-set-visibility', { fullscreen: true });
+                    // Hardware Acceleration (AMD VAAPI) on init
+                    this.send('mpv-set-prop', ['hwdec', 'vaapi']);
+                    // Observe track properties for HUD
+                    this.send('mpv-observe-prop', ['track-list', 'track-list']);
+                    this.send('mpv-observe-prop', ['aid', 'aid']);
+                    this.send('mpv-observe-prop', ['sid', 'sid']);
+                    this.send('mpv-observe-prop', ['sub-delay', 'sub-delay']);
+                    this.send('mpv-observe-prop', ['sub-scale', 'sub-scale']);
                 } catch (err) {
                     console.warn("[Stremio TV Bridge] Handshake warning:", err);
                 }
@@ -200,20 +244,36 @@
         }
 
         send(eventName, args) {
+            if (eventName === 'quit' || eventName === 'app-quit') {
+                requestCleanQuit();
+                return;
+            }
+
             if (eventName === 'mpv-set-prop') {
-                const name = Array.isArray(args) ? args[0] : (args && args.name);
-                const hasValue = Array.isArray(args) ? args.length >= 2 : (args && 'value' in args);
-                if (typeof name !== 'string' || !hasValue) {
-                    return;
-                }
-                if (BLOCKED_SET_PROPS.includes(name)) {
-                    return;
+                let name = Array.isArray(args) ? args[0] : (args && args.name);
+                let val = Array.isArray(args) ? args[1] : (args && args.value);
+                if (typeof name !== 'string') return;
+
+                if (BLOCKED_SET_PROPS.includes(name)) return;
+
+                // Color normalization for subtitles (Raw -9 fix)
+                if (name === 'sub-color' || name === 'sub-back-color' || name === 'sub-border-color') {
+                    val = formatMpvColor(val);
+                    if (Array.isArray(args)) args[1] = val;
+                    else if (args && 'value' in args) args.value = val;
                 }
             } else if (eventName === 'mpv-load') {
                 this.setMpvVisualState(true);
+                // Set default clean subtitle properties & HW acceleration
+                this.send('mpv-set-prop', ['hwdec', 'vaapi']);
+                this.send('mpv-set-prop', ['sub-color', '#FFFFFFFF']);
+                this.send('mpv-set-prop', ['sub-border-color', '#FF000000']);
+                this.send('mpv-set-prop', ['sub-border-size', 2.5]);
+                this.send('mpv-set-prop', ['sub-font-size', 48]);
             } else if (eventName === 'mpv-command' && Array.isArray(args)) {
                 if (args[0] === 'loadfile') {
                     this.setMpvVisualState(true);
+                    this.send('mpv-set-prop', ['hwdec', 'vaapi']);
                 } else if (args[0] === 'stop') {
                     this.setMpvVisualState(false);
                 }
@@ -280,9 +340,6 @@
     window.shellTransport = shellTransportInstance;
     window.stremio_server_ipc_key = "LINUX";
 
-    // Scoped Object.prototype.shellTransport getter/setter so tv.strem.io's
-    // selectVideoImplementation(commandArgs, options) selects ShellVideo (libmpv)
-    // without breaking strict-mode property assignments on unrelated objects.
     try {
         Object.defineProperty(Object.prototype, 'shellTransport', {
             get() {
@@ -309,10 +366,33 @@
     }
 
     // =========================================================================
-    // 3. Smart TV Platform Shim (Clean Exit from Couch UI + Splash Dismissal)
+    // 5. Automatic Route Exit Detection (Stop libmpv when leaving #/player)
     // =========================================================================
-    // Ensure window.loadedApp exists and is called once #app renders so the HTML
-    // splash overlay never hangs (even on the #/ Login route where MetaPreview is absent).
+    let wasInPlayerRoute = false;
+    function checkRouteState() {
+        const inPlayer = window.location.hash.startsWith('#/player');
+        if (wasInPlayerRoute && !inPlayer) {
+            console.log("[Stremio TV Bridge] Leaving player route (#/player). Stopping libmpv...");
+            try {
+                shellTransportInstance.send('mpv-command', ['stop']);
+                shellTransportInstance.send('mpv-set-prop', ['pause', true]);
+                shellTransportInstance.setMpvVisualState(false);
+                if (window.TrackHudManager) {
+                    window.TrackHudManager.close();
+                }
+            } catch (err) {
+                console.error("[Stremio TV Bridge] Error stopping libmpv on route exit:", err);
+            }
+        }
+        wasInPlayerRoute = inPlayer;
+    }
+    origWindowAddEventListener('hashchange', checkRouteState);
+    origWindowAddEventListener('popstate', checkRouteState);
+    setInterval(checkRouteState, 250);
+
+    // =========================================================================
+    // 6. Smart TV Platform Shim & Clean Exit
+    // =========================================================================
     window.loadedApp = window.loadedApp || function() {
         const splash = document.getElementById('loading-screen') || document.getElementById('splash');
         if (splash && splash.parentNode) {
@@ -321,13 +401,6 @@
     };
 
     function watchAppMountAndRoute() {
-        const checkHash = () => {
-            if (!window.location.hash.startsWith('#/player')) {
-                shellTransportInstance.setMpvVisualState(false);
-            }
-        };
-        origWindowAddEventListener('hashchange', checkHash);
-
         let splashDismissed = false;
         const appObserver = new MutationObserver(() => {
             if (splashDismissed) return;
@@ -339,7 +412,6 @@
                     if (typeof window.loadedApp === 'function') {
                         try { window.loadedApp(); } catch (e) {}
                     }
-                    // Bypass loader.js's hardcoded 10-second (1e4 ms) delay once UI is ready
                     setTimeout(() => {
                         const loaders = document.querySelectorAll('[class*="full_page_loader"]');
                         loaders.forEach(el => {
@@ -362,8 +434,6 @@
         watchAppMountAndRoute();
     }
 
-    // Shim window.tizen so tv.strem.io's native "Are you sure you want to quit?" modal
-    // (Platform.quit in module 66307) cleanly exits the Flatpak back to Steam Game Mode.
     if (typeof window.tizen === 'undefined') {
         window.tizen = {
             tvinputdevice: {
@@ -374,12 +444,7 @@
                 getCurrentApplication: function() {
                     return {
                         exit: function() {
-                            console.log("[Stremio TV Bridge] Exiting Stremio TV via Platform.quit()...");
-                            syncStorageToDisk();
-                            setTimeout(() => {
-                                try { shellTransportInstance.send('quit', {}); } catch (e) {}
-                                try { window.close(); } catch (e) {}
-                            }, 100);
+                            requestCleanQuit();
                         }
                     };
                 },
@@ -404,10 +469,10 @@
     }
 
     // =========================================================================
-    // 4. Dynamic CSS Transparency for Native MPV OpenGL Underlay
+    // 7. Dynamic CSS Transparency & Leanback Android TV Styling
     // =========================================================================
-    function injectTransparencyStyles() {
-        const styleId = "stremio-tv-transparent-bridge";
+    function injectStyles() {
+        const styleId = "stremio-tv-bridge-styles";
         if (document.getElementById(styleId)) return;
         const style = document.createElement("style");
         style.id = styleId;
@@ -415,6 +480,9 @@
             html, body {
                 background-color: #0b0b12;
                 transition: background-color 0.15s ease;
+            }
+            body.mouse-active, body.mouse-active * {
+                cursor: auto !important;
             }
             html.mpv-playing,
             html.mpv-playing body,
@@ -425,7 +493,6 @@
                 background: transparent !important;
                 background-color: transparent !important;
             }
-            /* Guarantee video layer transparency during playback */
             [class*="player-container"],
             [class*="video-container"],
             [class*="Player_playerContainer"],
@@ -433,17 +500,367 @@
                 background: transparent !important;
                 background-color: transparent !important;
             }
+
+            /* Android TV Card Focus & Leanback Scaling */
+            [tabindex]:focus,
+            .focusable:focus,
+            a:focus,
+            button:focus,
+            [data-focusable]:focus,
+            [class*="card"]:focus,
+            [class*="poster"]:focus,
+            [class*="item"]:focus {
+                outline: 3px solid #8a2be2 !important;
+                outline-offset: 2px !important;
+                transform: scale(1.04) translateZ(0) !important;
+                box-shadow: 0 12px 30px rgba(138, 43, 226, 0.45) !important;
+                transition: transform 0.18s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.18s ease, outline 0.18s ease !important;
+                z-index: 10 !important;
+            }
+
+            /* Quick Settings / Track HUD Overlay */
+            #stremio-tv-track-hud {
+                position: fixed;
+                top: 0;
+                right: 0;
+                width: 440px;
+                height: 100vh;
+                background: rgba(12, 12, 20, 0.93);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-left: 1px solid rgba(255, 255, 255, 0.12);
+                box-shadow: -15px 0 35px rgba(0, 0, 0, 0.85);
+                z-index: 999999;
+                color: #ffffff;
+                font-family: 'Inter', system-ui, -apple-system, sans-serif;
+                display: flex;
+                flex-direction: column;
+                padding: 24px;
+                box-sizing: border-box;
+                transform: translateX(100%);
+                transition: transform 0.25s cubic-bezier(0.1, 0.9, 0.2, 1);
+            }
+            #stremio-tv-track-hud.hud-open {
+                transform: translateX(0);
+            }
+            #stremio-tv-track-hud h2 {
+                margin: 0 0 16px 0;
+                font-size: 20px;
+                font-weight: 700;
+                color: #ffffff;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                padding-bottom: 12px;
+            }
+            #stremio-tv-track-hud .hud-tabs {
+                display: flex;
+                gap: 8px;
+                margin-bottom: 16px;
+            }
+            #stremio-tv-track-hud .hud-tab {
+                flex: 1;
+                padding: 8px 12px;
+                background: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                color: #aaaaaa;
+                text-align: center;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+            }
+            #stremio-tv-track-hud .hud-tab.active,
+            #stremio-tv-track-hud .hud-tab:focus {
+                background: #8a2be2;
+                color: #ffffff;
+                border-color: #a259ff;
+                outline: none;
+            }
+            #stremio-tv-track-hud .hud-content {
+                flex: 1;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            #stremio-tv-track-hud .hud-item {
+                padding: 12px 16px;
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                font-size: 14px;
+                color: #dddddd;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            #stremio-tv-track-hud .hud-item:focus,
+            #stremio-tv-track-hud .hud-item.selected {
+                background: rgba(138, 43, 226, 0.35);
+                border-color: #8a2be2;
+                color: #ffffff;
+                outline: none;
+            }
+            #stremio-tv-track-hud .hud-item.selected::after {
+                content: "✓";
+                font-weight: bold;
+                color: #a259ff;
+            }
+            #stremio-tv-track-hud .hud-ctrl-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 10px 14px;
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 10px;
+                margin-top: 6px;
+            }
+            #stremio-tv-track-hud .hud-btn {
+                padding: 6px 14px;
+                background: rgba(255, 255, 255, 0.12);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 6px;
+                color: #fff;
+                font-weight: 600;
+                cursor: pointer;
+            }
+            #stremio-tv-track-hud .hud-btn:focus {
+                background: #8a2be2;
+                outline: none;
+            }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
     if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", injectTransparencyStyles);
+        document.addEventListener("DOMContentLoaded", injectStyles);
     } else {
-        injectTransparencyStyles();
+        injectStyles();
     }
 
     // =========================================================================
-    // 5. Key Dispatch Helper & Editable Input Detection (M5 BT QWERTY Support)
+    // 8. Track & Subtitle Quick Settings HUD Overlay Manager
+    // =========================================================================
+    class TrackHud {
+        constructor() {
+            this.tracks = [];
+            this.aid = 'auto';
+            this.sid = 'auto';
+            this.subDelay = 0;
+            this.subScale = 1.0;
+            this.subFontSize = 48;
+            this.isOpen = false;
+            this.activeTab = 'subtitles'; // 'audio' | 'subtitles' | 'settings'
+            this.container = null;
+            this.initDOM();
+        }
+
+        initDOM() {
+            const build = () => {
+                if (document.getElementById('stremio-tv-track-hud')) return;
+                const el = document.createElement('div');
+                el.id = 'stremio-tv-track-hud';
+                el.innerHTML = `
+                    <h2>
+                        <span>Audio & Subtitles</span>
+                        <span style="font-size: 12px; opacity: 0.6;">[ESC / B to Close]</span>
+                    </h2>
+                    <div class="hud-tabs">
+                        <button class="hud-tab" data-tab="subtitles" tabindex="0">Subtitles</button>
+                        <button class="hud-tab" data-tab="audio" tabindex="0">Audio</button>
+                        <button class="hud-tab" data-tab="settings" tabindex="0">Settings</button>
+                    </div>
+                    <div class="hud-content" id="hud-content-panel"></div>
+                `;
+                document.body.appendChild(el);
+                this.container = el;
+
+                el.querySelectorAll('.hud-tab').forEach(tabBtn => {
+                    tabBtn.addEventListener('click', () => {
+                        this.activeTab = tabBtn.getAttribute('data-tab');
+                        this.renderContent();
+                    });
+                    tabBtn.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter' || e.keyCode === 13) {
+                            this.activeTab = tabBtn.getAttribute('data-tab');
+                            this.renderContent();
+                        }
+                    });
+                });
+            };
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', build, { once: true });
+            } else {
+                build();
+            }
+        }
+
+        handlePropChange(data) {
+            if (!data || !data.name) return;
+            if (data.name === 'track-list' && Array.isArray(data.data)) {
+                this.tracks = data.data;
+                if (this.isOpen) this.renderContent();
+            } else if (data.name === 'aid') {
+                this.aid = data.data;
+                if (this.isOpen) this.renderContent();
+            } else if (data.name === 'sid') {
+                this.sid = data.data;
+                if (this.isOpen) this.renderContent();
+            } else if (data.name === 'sub-delay') {
+                this.subDelay = typeof data.data === 'number' ? data.data : 0;
+                if (this.isOpen) this.renderContent();
+            } else if (data.name === 'sub-scale') {
+                this.subScale = typeof data.data === 'number' ? data.data : 1.0;
+                if (this.isOpen) this.renderContent();
+            }
+        }
+
+        toggle() {
+            if (this.isOpen) this.close();
+            else this.open();
+        }
+
+        open() {
+            if (!this.container) this.initDOM();
+            if (!this.container) return;
+            this.isOpen = true;
+            this.container.classList.add('hud-open');
+            this.renderContent();
+            setTimeout(() => {
+                const first = this.container.querySelector('.hud-tab.active') || this.container.querySelector('[tabindex="0"]');
+                if (first) try { first.focus(); } catch (e) {}
+            }, 50);
+        }
+
+        close() {
+            if (!this.container) return;
+            this.isOpen = false;
+            this.container.classList.remove('hud-open');
+        }
+
+        renderContent() {
+            if (!this.container) return;
+            const content = this.container.querySelector('#hud-content-panel');
+            if (!content) return;
+            content.innerHTML = '';
+
+            // Update tab button active states
+            this.container.querySelectorAll('.hud-tab').forEach(tb => {
+                if (tb.getAttribute('data-tab') === this.activeTab) tb.classList.add('active');
+                else tb.classList.remove('active');
+            });
+
+            if (this.activeTab === 'subtitles') {
+                const subTracks = this.tracks.filter(t => t.type === 'sub');
+                // Option Off
+                const offItem = document.createElement('div');
+                offItem.className = 'hud-item' + (this.sid === 'no' || this.sid === false || this.sid === 0 ? ' selected' : '');
+                offItem.tabIndex = 0;
+                offItem.textContent = 'Off';
+                offItem.onclick = () => {
+                    shellTransportInstance.send('mpv-set-prop', ['sid', 'no']);
+                    this.sid = 'no';
+                    this.renderContent();
+                };
+                content.appendChild(offItem);
+
+                subTracks.forEach(t => {
+                    const item = document.createElement('div');
+                    const isSelected = (this.sid === t.id) || (t.selected === true);
+                    item.className = 'hud-item' + (isSelected ? ' selected' : '');
+                    item.tabIndex = 0;
+                    const label = (t.lang ? '[' + t.lang.toUpperCase() + '] ' : '') + (t.title || 'Track ' + t.id);
+                    item.textContent = label;
+                    item.onclick = () => {
+                        shellTransportInstance.send('mpv-set-prop', ['sid', t.id]);
+                        this.sid = t.id;
+                        this.renderContent();
+                    };
+                    item.onkeydown = (e) => {
+                        if (e.key === 'Enter' || e.keyCode === 13) {
+                            item.onclick();
+                        }
+                    };
+                    content.appendChild(item);
+                });
+            } else if (this.activeTab === 'audio') {
+                const audioTracks = this.tracks.filter(t => t.type === 'audio');
+                audioTracks.forEach(t => {
+                    const item = document.createElement('div');
+                    const isSelected = (this.aid === t.id) || (t.selected === true);
+                    item.className = 'hud-item' + (isSelected ? ' selected' : '');
+                    item.tabIndex = 0;
+                    const label = (t.lang ? '[' + t.lang.toUpperCase() + '] ' : '') + (t.title || 'Audio Track ' + t.id);
+                    item.textContent = label;
+                    item.onclick = () => {
+                        shellTransportInstance.send('mpv-set-prop', ['aid', t.id]);
+                        this.aid = t.id;
+                        this.renderContent();
+                    };
+                    item.onkeydown = (e) => {
+                        if (e.key === 'Enter' || e.keyCode === 13) {
+                            item.onclick();
+                        }
+                    };
+                    content.appendChild(item);
+                });
+            } else if (this.activeTab === 'settings') {
+                // Subtitle Delay
+                const delayRow = document.createElement('div');
+                delayRow.className = 'hud-ctrl-row';
+                delayRow.innerHTML = `
+                    <span>Subtitle Delay: <strong>${(this.subDelay || 0).toFixed(1)}s</strong></span>
+                    <div>
+                        <button class="hud-btn" id="hud-delay-minus" tabindex="0">-0.5s</button>
+                        <button class="hud-btn" id="hud-delay-plus" tabindex="0">+0.5s</button>
+                    </div>
+                `;
+                content.appendChild(delayRow);
+
+                delayRow.querySelector('#hud-delay-minus').onclick = () => {
+                    this.subDelay = (this.subDelay || 0) - 0.5;
+                    shellTransportInstance.send('mpv-set-prop', ['sub-delay', this.subDelay]);
+                    this.renderContent();
+                };
+                delayRow.querySelector('#hud-delay-plus').onclick = () => {
+                    this.subDelay = (this.subDelay || 0) + 0.5;
+                    shellTransportInstance.send('mpv-set-prop', ['sub-delay', this.subDelay]);
+                    this.renderContent();
+                };
+
+                // Subtitle Size / Scale
+                const scaleRow = document.createElement('div');
+                scaleRow.className = 'hud-ctrl-row';
+                scaleRow.innerHTML = `
+                    <span>Subtitle Size: <strong>${Math.round((this.subScale || 1.0) * 100)}%</strong></span>
+                    <div>
+                        <button class="hud-btn" id="hud-scale-minus" tabindex="0">Smaller</button>
+                        <button class="hud-btn" id="hud-scale-plus" tabindex="0">Larger</button>
+                    </div>
+                `;
+                content.appendChild(scaleRow);
+
+                scaleRow.querySelector('#hud-scale-minus').onclick = () => {
+                    this.subScale = Math.max(0.5, (this.subScale || 1.0) - 0.1);
+                    shellTransportInstance.send('mpv-set-prop', ['sub-scale', this.subScale]);
+                    this.renderContent();
+                };
+                scaleRow.querySelector('#hud-scale-plus').onclick = () => {
+                    this.subScale = Math.min(2.5, (this.subScale || 1.0) + 0.1);
+                    shellTransportInstance.send('mpv-set-prop', ['sub-scale', this.subScale]);
+                    this.renderContent();
+                };
+            }
+        }
+    }
+
+    const trackHudInstance = new TrackHud();
+    window.TrackHudManager = trackHudInstance;
+
+    // =========================================================================
+    // 9. Key Dispatch Helper & Editable Input Detection
     // =========================================================================
     function isEditableFocused() {
         const el = document.activeElement;
@@ -462,7 +879,6 @@
             cancelable: true,
             view: window
         });
-        // Guarantee e.keyCode and e.which match tv.strem.io module 60715's integer checks
         try {
             Object.defineProperty(evt, 'keyCode', { get: () => cfg.keyCode });
             Object.defineProperty(evt, 'which', { get: () => cfg.keyCode });
@@ -480,31 +896,24 @@
     }
 
     // =========================================================================
-    // 6. Comprehensive Gamepad API -> Spatial Navigation Mapper (with Cooldown)
+    // 10. Comprehensive Gamepad API -> Spatial Navigation Mapper
     // =========================================================================
-    // Uses tv.strem.io's exact module 60715 keyCodes:
-    //   up: 38, down: 40, left: 37, right: 39, enter: 13, back: 8/27,
-    //   playPause: 32, seekPrev: 412, seekNext: 417
     const BUTTON_CONFIG = {
-        // D-Pad buttons
         12: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
         13: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
         14: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
         15: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
 
-        // Face Buttons
-        0:  { key: 'Enter', code: 'Enter', keyCode: 13 },              // A / Cross (Confirm / Select)
-        1:  { key: 'Escape', code: 'Escape', keyCode: 27 },            // B / Circle (Back)
-        2:  { key: ' ', code: 'Space', keyCode: 32 },                  // X / Square (Play / Pause)
-        3:  { key: 'MediaSubtitles', code: 'KeyV', keyCode: 86, action: 'subtitles' }, // Y / Triangle (Subtitles)
+        0:  { key: 'Enter', code: 'Enter', keyCode: 13 },
+        1:  { key: 'Escape', code: 'Escape', keyCode: 27 },
+        2:  { key: ' ', code: 'Space', keyCode: 32 },
+        3:  { key: 'MediaSubtitles', code: 'KeyV', keyCode: 86, action: 'subtitles' },
 
-        // Bumpers (Seek in Player)
-        4:  { key: 'MediaRewind', code: 'MediaRewind', keyCode: 412 },         // L1 / LB (Seek Prev)
-        5:  { key: 'MediaFastForward', code: 'MediaFastForward', keyCode: 417 }, // R1 / RB (Seek Next)
+        4:  { key: 'MediaRewind', code: 'MediaRewind', keyCode: 412 },
+        5:  { key: 'MediaFastForward', code: 'MediaFastForward', keyCode: 417 },
 
-        // Menu / View
-        8:  { key: 'Escape', code: 'Escape', keyCode: 27 },            // View / Select (Back)
-        9:  { key: ' ', code: 'Space', keyCode: 32 }                   // Menu / Start (Play / Pause)
+        8:  { key: 'Escape', code: 'Escape', keyCode: 27 },
+        9:  { key: ' ', code: 'Space', keyCode: 32 }
     };
 
     const AXIS_DEADZONE = 0.5;
@@ -516,10 +925,8 @@
 
     function triggerButtonConfig(type, cfg) {
         if (type === 'keydown' && cfg.action === 'subtitles') {
-            if (window.location.hash.startsWith('#/player') && !window.location.href.includes('subtitles=true')) {
-                window.location.href = window.location.href + (window.location.href.includes('?') ? '&' : '?') + 'subtitles=true';
-                return;
-            }
+            trackHudInstance.toggle();
+            return;
         }
         dispatchKeyEvent(type, cfg);
     }
@@ -528,7 +935,6 @@
         const wasPressed = buttonState[id] || false;
         if (isPressed && !wasPressed) {
             buttonState[id] = true;
-            // Anti-double-input guard: skip if Steam Input already sent a keyboard event
             if (Date.now() - lastNativeKeyTime >= COOLDOWN_MS) {
                 triggerButtonConfig('keydown', cfg);
             }
@@ -587,7 +993,7 @@
 
     function startPolling() {
         if (!pollTimer) {
-            pollTimer = setInterval(pollGamepads, 16); // 60Hz polling
+            pollTimer = setInterval(pollGamepads, 16);
         }
     }
 
@@ -612,21 +1018,60 @@
     startPolling();
 
     // =========================================================================
-    // 7. M5 BT English Remote Control (2.4GHz / BT 5.0 + Air-Mouse + QWERTY)
+    // 11. Mouse Movement, Air-Mouse Clicks, Scroll Wheel & Key Normalization
     // =========================================================================
-    // 7a. Air-Mouse Right-Click -> Back Navigation:
-    // On the M5 BT remote (and G10/G20/WeChip air remotes), pressing the Back/Return
-    // button while in Air-Mouse mode emits a mouse right-click (contextmenu).
-    // Suppress the browser context menu and trigger Stremio Back navigation!
+    let mouseTimer = null;
+    origWindowAddEventListener('mousemove', () => {
+        if (document.body) {
+            document.body.classList.add('mouse-active');
+            if (mouseTimer) clearTimeout(mouseTimer);
+            mouseTimer = setTimeout(() => {
+                if (document.body) document.body.classList.remove('mouse-active');
+            }, 3500);
+        }
+    }, true);
+
+    // M5 Air-Mouse Click / Pointerup Bridge to TV Spatial Navigation
+    origWindowAddEventListener('pointerup', (e) => {
+        if (e.button !== 0 || !e.target) return;
+        const target = e.target;
+
+        // If click is inside HUD or HUD open, let normal DOM handle it
+        if (trackHudInstance.isOpen) return;
+
+        const focusable = target.closest('[tabindex], .focusable, a, button, [data-focusable], [role="button"], input, select, textarea, [class*="card"], [class*="poster"], [class*="item"], [class*="button"]');
+        if (focusable) {
+            try { focusable.focus(); } catch (err) {}
+            if (!isEditableFocused()) {
+                dispatchKeyEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13 });
+            }
+        }
+    }, true);
+
+    // Scroll Wheel Support -> Throttled ArrowUp / ArrowDown
+    let lastWheelTime = 0;
+    origWindowAddEventListener('wheel', (e) => {
+        if (Date.now() - lastWheelTime < 90) return;
+        lastWheelTime = Date.now();
+        if (e.deltaY > 0) {
+            dispatchKeyEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 });
+        } else if (e.deltaY < 0) {
+            dispatchKeyEvent('keydown', { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 });
+        }
+    }, { capture: true, passive: true });
+
+    // Air-Mouse Right-Click -> Back Navigation
     origWindowAddEventListener('contextmenu', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        dispatchKeyEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27 });
+        if (trackHudInstance.isOpen) {
+            trackHudInstance.close();
+        } else {
+            dispatchKeyEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27 });
+        }
     }, true);
 
-    // 7b. Air-Mouse Left-Click on <input>/<textarea>:
-    // tv.strem.io module 60715 calls e.preventDefault() on document mousedown, which
-    // prevents clicking an <input> with the M5 BT Air-Mouse from focusing it.
+    // Focus input on mousedown
     origWindowAddEventListener('mousedown', (e) => {
         if (e.button === 0 && e.target) {
             const tag = (e.target.tagName || '').toUpperCase();
@@ -638,14 +1083,24 @@
         }
     }, true);
 
-    // 7c. Keydown Normalizer & M5 BT Rear QWERTY Text-Input Protection:
+    // Keydown Capture Phase Normalization
     origWindowAddEventListener('keydown', (e) => {
         if (e.isBridgeSynthetic) return;
         lastNativeKeyTime = Date.now();
 
+        // If HUD is open, handle HUD navigation
+        if (trackHudInstance.isOpen) {
+            if (e.key === 'Escape' || e.keyCode === 27) {
+                e.preventDefault();
+                e.stopPropagation();
+                trackHudInstance.close();
+                return;
+            }
+        }
+
         const editing = isEditableFocused();
 
-        // Hardware Volume Keys on M5 BT Remote (work globally even when editing)
+        // Volume keys
         if (e.key === 'AudioVolumeUp' || e.key === 'XF86AudioRaiseVolume' || e.keyCode === 175) {
             shellTransportInstance.adjustVolume(5);
             return;
@@ -659,10 +1114,6 @@
             return;
         }
 
-        // When typing on the M5 BT rear QWERTY keyboard inside a Search or Login <input>:
-        // Protect Backspace (8) and letters x (88), g (71), j (74), e (69), h (72)
-        // from tv.strem.io module 60715's document keydown listener (which otherwise
-        // treats keyCode 8 and 88 as 'back' and navigates away from the input page!).
         if (editing) {
             if (e.key === 'BrowserBack' || e.key === 'GoBack' || e.key === 'XF86Back') {
                 e.preventDefault();
@@ -679,9 +1130,6 @@
                 window.location.hash = '#/home';
                 return;
             }
-            // Let ArrowUp, ArrowDown, Enter, Escape bubble to spatial navigation so the user
-            // can move focus out of the input box or submit; stop propagation for typing keys
-            // that collide with module 60715's media/back keycodes (8, 88, 71, 74, 69, 72).
             const collidingCodes = [8, 69, 71, 72, 74, 88];
             if (collidingCodes.includes(e.keyCode) || (e.key && e.key.length === 1)) {
                 e.stopPropagation();
@@ -689,7 +1137,15 @@
             return;
         }
 
-        // Not editing an <input>: handle M5 BT Front Remote & Media keys
+        // Toggle Subtitle / Audio Track HUD via 'S', 'C', 'V', or Menu keys in Player
+        if ((e.key === 's' || e.key === 'S' || e.key === 'c' || e.key === 'C' || e.key === 'v' || e.key === 'V') &&
+            window.location.hash.startsWith('#/player')) {
+            e.preventDefault();
+            e.stopPropagation();
+            trackHudInstance.toggle();
+            return;
+        }
+
         if (e.key === 'BrowserHome' || e.key === 'XF86HomePage' || e.key === 'Home' || e.keyCode === 172 || e.keyCode === 36) {
             e.preventDefault();
             e.stopPropagation();
@@ -738,10 +1194,11 @@
             case 'ContextMenu':
             case 'Menu':
             case 'XF86MenuPB':
-                if (window.location.hash.startsWith('#/player') && !window.location.href.includes('ctx.settings=true')) {
+            case 'F10':
+                if (window.location.hash.startsWith('#/player')) {
                     e.preventDefault();
                     e.stopPropagation();
-                    window.location.href = window.location.href + (window.location.href.includes('?') ? '&' : '?') + 'ctx.settings=true';
+                    trackHudInstance.toggle();
                     return;
                 }
                 mapped = { key: 'Escape', code: 'Escape', keyCode: 27 };

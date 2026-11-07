@@ -41,7 +41,8 @@
         "--talk-name=org.kde.StatusNotifierWatcher",
         "--own-name=org.mpris.MediaPlayer2.Stremio",
         "--env=SERVER_PATH=/app/libexec/stremio/server.js",
-        "--env=ANV_DEBUG=video-decode,video-encode"
+        "--env=ANV_DEBUG=video-decode,video-encode",
+        "--env=MPV_HA=yes"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin"
