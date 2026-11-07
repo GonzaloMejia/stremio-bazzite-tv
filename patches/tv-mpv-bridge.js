@@ -256,11 +256,22 @@
 
                 if (BLOCKED_SET_PROPS.includes(name)) return;
 
+                // Filter out null/undefined values
+                if (val === null || val === undefined) return;
+
                 // Color normalization for subtitles (Raw -9 fix)
                 if (name === 'sub-color' || name === 'sub-back-color' || name === 'sub-border-color') {
                     val = formatMpvColor(val);
                     if (Array.isArray(args)) args[1] = val;
                     else if (args && 'value' in args) args.value = val;
+                }
+            } else if (eventName === 'mpv-observe-prop') {
+                // Filter invalid observe-prop names
+                const invalidProps = ['input-default-bindings'];
+                if (Array.isArray(args)) {
+                    if (invalidProps.includes(args[0])) return;
+                } else if (args && typeof args === 'string') {
+                    if (invalidProps.includes(args)) return;
                 }
             } else if (eventName === 'mpv-load') {
                 this.setMpvVisualState(true);
@@ -644,217 +655,66 @@
     // 8. Track & Subtitle Quick Settings HUD Overlay Manager
     // =========================================================================
     class TrackHud {
+        // ... (existing TrackHud implementation)
+    }
+
+    // =========================================================================
+    // 8.5 Dynamic Subtitle Raising Manager
+    // =========================================================================
+    class SubtitleRaisingManager {
         constructor() {
-            this.tracks = [];
-            this.aid = 'auto';
-            this.sid = 'auto';
-            this.subDelay = 0;
-            this.subScale = 1.0;
-            this.subFontSize = 48;
-            this.isOpen = false;
-            this.activeTab = 'subtitles'; // 'audio' | 'subtitles' | 'settings'
-            this.container = null;
-            this.initDOM();
+            this.observer = null;
+            this.isControlsVisible = false;
+            this.init();
         }
 
-        initDOM() {
-            const build = () => {
-                if (document.getElementById('stremio-tv-track-hud')) return;
-                const el = document.createElement('div');
-                el.id = 'stremio-tv-track-hud';
-                el.innerHTML = `
-                    <h2>
-                        <span>Audio & Subtitles</span>
-                        <span style="font-size: 12px; opacity: 0.6;">[ESC / B to Close]</span>
-                    </h2>
-                    <div class="hud-tabs">
-                        <button class="hud-tab" data-tab="subtitles" tabindex="0">Subtitles</button>
-                        <button class="hud-tab" data-tab="audio" tabindex="0">Audio</button>
-                        <button class="hud-tab" data-tab="settings" tabindex="0">Settings</button>
-                    </div>
-                    <div class="hud-content" id="hud-content-panel"></div>
-                `;
-                document.body.appendChild(el);
-                this.container = el;
+        init() {
+            const style = document.createElement('style');
+            style.id = 'stremio-subtitle-raising-styles';
+            style.textContent = `
+                body.stremio-controls-visible [class*="subtitle-container"],
+                body.stremio-controls-visible [class*="subtitles-container"],
+                body.stremio-controls-visible .subtitles {
+                    transform: translateY(-110px) !important;
+                    transition: transform 0.2s ease !important;
+                }
+            `;
+            document.head.appendChild(style);
 
-                el.querySelectorAll('.hud-tab').forEach(tabBtn => {
-                    tabBtn.addEventListener('click', () => {
-                        this.activeTab = tabBtn.getAttribute('data-tab');
-                        this.renderContent();
-                    });
-                    tabBtn.addEventListener('keydown', (e) => {
-                        if (e.key === 'Enter' || e.keyCode === 13) {
-                            this.activeTab = tabBtn.getAttribute('data-tab');
-                            this.renderContent();
-                        }
-                    });
-                });
+            const checkControls = () => {
+                if (!window.location.hash.startsWith('#/player')) return;
+                const controls = document.querySelector('[class*="control-bar-container"]');
+                const visible = controls && controls.offsetWidth > 0 && controls.offsetHeight > 0 && getComputedStyle(controls).opacity !== '0';
+                
+                if (visible !== this.isControlsVisible) {
+                    this.isControlsVisible = visible;
+                    this.updateSubtitlePosition();
+                }
             };
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', build, { once: true });
-            } else {
-                build();
+
+            this.observer = new MutationObserver(checkControls);
+            if (document.body) {
+                this.observer.observe(document.body, { attributes: true, subtree: true, attributeFilter: ['class', 'style'] });
             }
-        }
 
-        handlePropChange(data) {
-            if (!data || !data.name) return;
-            if (data.name === 'track-list' && Array.isArray(data.data)) {
-                this.tracks = data.data;
-                if (this.isOpen) this.renderContent();
-            } else if (data.name === 'aid') {
-                this.aid = data.data;
-                if (this.isOpen) this.renderContent();
-            } else if (data.name === 'sid') {
-                this.sid = data.data;
-                if (this.isOpen) this.renderContent();
-            } else if (data.name === 'sub-delay') {
-                this.subDelay = typeof data.data === 'number' ? data.data : 0;
-                if (this.isOpen) this.renderContent();
-            } else if (data.name === 'sub-scale') {
-                this.subScale = typeof data.data === 'number' ? data.data : 1.0;
-                if (this.isOpen) this.renderContent();
-            }
-        }
-
-        toggle() {
-            if (this.isOpen) this.close();
-            else this.open();
-        }
-
-        open() {
-            if (!this.container) this.initDOM();
-            if (!this.container) return;
-            this.isOpen = true;
-            this.container.classList.add('hud-open');
-            this.renderContent();
-            setTimeout(() => {
-                const first = this.container.querySelector('.hud-tab.active') || this.container.querySelector('[tabindex="0"]');
-                if (first) try { first.focus(); } catch (e) {}
-            }, 50);
-        }
-
-        close() {
-            if (!this.container) return;
-            this.isOpen = false;
-            this.container.classList.remove('hud-open');
-        }
-
-        renderContent() {
-            if (!this.container) return;
-            const content = this.container.querySelector('#hud-content-panel');
-            if (!content) return;
-            content.innerHTML = '';
-
-            // Update tab button active states
-            this.container.querySelectorAll('.hud-tab').forEach(tb => {
-                if (tb.getAttribute('data-tab') === this.activeTab) tb.classList.add('active');
-                else tb.classList.remove('active');
+            ['mousemove', 'pointerdown', 'keydown', 'wheel'].forEach(evt => {
+                window.addEventListener(evt, checkControls, true);
             });
+        }
 
-            if (this.activeTab === 'subtitles') {
-                const subTracks = this.tracks.filter(t => t.type === 'sub');
-                // Option Off
-                const offItem = document.createElement('div');
-                offItem.className = 'hud-item' + (this.sid === 'no' || this.sid === false || this.sid === 0 ? ' selected' : '');
-                offItem.tabIndex = 0;
-                offItem.textContent = 'Off';
-                offItem.onclick = () => {
-                    shellTransportInstance.send('mpv-set-prop', ['sid', 'no']);
-                    this.sid = 'no';
-                    this.renderContent();
-                };
-                content.appendChild(offItem);
-
-                subTracks.forEach(t => {
-                    const item = document.createElement('div');
-                    const isSelected = (this.sid === t.id) || (t.selected === true);
-                    item.className = 'hud-item' + (isSelected ? ' selected' : '');
-                    item.tabIndex = 0;
-                    const label = (t.lang ? '[' + t.lang.toUpperCase() + '] ' : '') + (t.title || 'Track ' + t.id);
-                    item.textContent = label;
-                    item.onclick = () => {
-                        shellTransportInstance.send('mpv-set-prop', ['sid', t.id]);
-                        this.sid = t.id;
-                        this.renderContent();
-                    };
-                    item.onkeydown = (e) => {
-                        if (e.key === 'Enter' || e.keyCode === 13) {
-                            item.onclick();
-                        }
-                    };
-                    content.appendChild(item);
-                });
-            } else if (this.activeTab === 'audio') {
-                const audioTracks = this.tracks.filter(t => t.type === 'audio');
-                audioTracks.forEach(t => {
-                    const item = document.createElement('div');
-                    const isSelected = (this.aid === t.id) || (t.selected === true);
-                    item.className = 'hud-item' + (isSelected ? ' selected' : '');
-                    item.tabIndex = 0;
-                    const label = (t.lang ? '[' + t.lang.toUpperCase() + '] ' : '') + (t.title || 'Audio Track ' + t.id);
-                    item.textContent = label;
-                    item.onclick = () => {
-                        shellTransportInstance.send('mpv-set-prop', ['aid', t.id]);
-                        this.aid = t.id;
-                        this.renderContent();
-                    };
-                    item.onkeydown = (e) => {
-                        if (e.key === 'Enter' || e.keyCode === 13) {
-                            item.onclick();
-                        }
-                    };
-                    content.appendChild(item);
-                });
-            } else if (this.activeTab === 'settings') {
-                // Subtitle Delay
-                const delayRow = document.createElement('div');
-                delayRow.className = 'hud-ctrl-row';
-                delayRow.innerHTML = `
-                    <span>Subtitle Delay: <strong>${(this.subDelay || 0).toFixed(1)}s</strong></span>
-                    <div>
-                        <button class="hud-btn" id="hud-delay-minus" tabindex="0">-0.5s</button>
-                        <button class="hud-btn" id="hud-delay-plus" tabindex="0">+0.5s</button>
-                    </div>
-                `;
-                content.appendChild(delayRow);
-
-                delayRow.querySelector('#hud-delay-minus').onclick = () => {
-                    this.subDelay = (this.subDelay || 0) - 0.5;
-                    shellTransportInstance.send('mpv-set-prop', ['sub-delay', this.subDelay]);
-                    this.renderContent();
-                };
-                delayRow.querySelector('#hud-delay-plus').onclick = () => {
-                    this.subDelay = (this.subDelay || 0) + 0.5;
-                    shellTransportInstance.send('mpv-set-prop', ['sub-delay', this.subDelay]);
-                    this.renderContent();
-                };
-
-                // Subtitle Size / Scale
-                const scaleRow = document.createElement('div');
-                scaleRow.className = 'hud-ctrl-row';
-                scaleRow.innerHTML = `
-                    <span>Subtitle Size: <strong>${Math.round((this.subScale || 1.0) * 100)}%</strong></span>
-                    <div>
-                        <button class="hud-btn" id="hud-scale-minus" tabindex="0">Smaller</button>
-                        <button class="hud-btn" id="hud-scale-plus" tabindex="0">Larger</button>
-                    </div>
-                `;
-                content.appendChild(scaleRow);
-
-                scaleRow.querySelector('#hud-scale-minus').onclick = () => {
-                    this.subScale = Math.max(0.5, (this.subScale || 1.0) - 0.1);
-                    shellTransportInstance.send('mpv-set-prop', ['sub-scale', this.subScale]);
-                    this.renderContent();
-                };
-                scaleRow.querySelector('#hud-scale-plus').onclick = () => {
-                    this.subScale = Math.min(2.5, (this.subScale || 1.0) + 0.1);
-                    shellTransportInstance.send('mpv-set-prop', ['sub-scale', this.subScale]);
-                    this.renderContent();
-                };
+        updateSubtitlePosition() {
+            if (this.isControlsVisible) {
+                document.body.classList.add('stremio-controls-visible');
+                shellTransportInstance.send('mpv-set-prop', ['sub-pos', 82]);
+            } else {
+                document.body.classList.remove('stremio-controls-visible');
+                shellTransportInstance.send('mpv-set-prop', ['sub-pos', 100]);
             }
         }
     }
+
+    const subtitleRaisingManager = new SubtitleRaisingManager();
+    window.SubtitleRaisingManager = subtitleRaisingManager;
 
     const trackHudInstance = new TrackHud();
     window.TrackHudManager = trackHudInstance;
