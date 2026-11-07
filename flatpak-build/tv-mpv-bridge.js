@@ -10,12 +10,20 @@
     fetch('http://127.0.0.1:11471/__log?msg=bridge-loaded').catch(() => {});
 
     // =========================================================================
-    // 0. Robust & Safe IPC Interception
+    // 0. Robust & Safe Async IPC Interception
     // =========================================================================
+    let pendingMessages = [];
+    let transport = null;
+
     const originalPostMessage = (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc) ? window.webkit.messageHandlers.ipc.postMessage.bind(window.webkit.messageHandlers.ipc) : null;
+
+    function flushQueue() {
+        while (pendingMessages.length > 0) interceptAndSend(pendingMessages.shift());
+    }
 
     function interceptAndSend(message) {
         try {
+            // IPC Filtering logic
             let parsed = typeof message === 'string' ? JSON.parse(message) : message;
             if (parsed && parsed.type === 6 && Array.isArray(parsed.args)) {
                 const [eventName, args] = parsed.args;
@@ -26,26 +34,26 @@
                 }
                 if (eventName === 'mpv-observe-prop' && ['input-default-bindings'].includes(Array.isArray(args) ? args[0] : args)) return;
             }
-            if (originalPostMessage) originalPostMessage(typeof message === 'string' ? message : JSON.stringify(message));
-            else if (window.qt && window.qt.webChannelTransport && typeof window.qt.webChannelTransport.send === 'function') window.qt.webChannelTransport.send(message);
+
+            if (originalPostMessage) {
+                originalPostMessage(typeof message === 'string' ? message : JSON.stringify(message));
+            } else if (transport && typeof transport.send === 'function') {
+                transport.send(message);
+            } else {
+                pendingMessages.push(message);
+            }
         } catch (e) { console.error("[Bridge] IPC Error:", e); }
     }
 
-    // Lazy Proxy for window.qt
-    Object.defineProperty(window, 'qt', {
-        configurable: true,
-        get() { return this._qt || {}; },
-        set(val) {
-            this._qt = val;
-            if (val && !val.webChannelTransport) {
-                Object.defineProperty(val, 'webChannelTransport', {
-                    get() { return this._wct || { send: () => {} }; },
-                    set(wct) { this._wct = wct; },
-                    configurable: true
-                });
-            }
+    // Monitor for window.qt
+    const monitorInterval = setInterval(() => {
+        if (window.qt && window.qt.webChannelTransport) {
+            transport = window.qt.webChannelTransport;
+            clearInterval(monitorInterval);
+            flushQueue();
+            console.log("[Bridge] Qt transport initialized.");
         }
-    });
+    }, 10);
 
     // =========================================================================
     // 1. Color Normalization
@@ -98,16 +106,21 @@
             const now = Date.now();
             if (now - this.lastAxis > 150) {
                 const dpad = [gp.buttons[12], gp.buttons[13], gp.buttons[14], gp.buttons[15]];
-                const axes = [gp.axes[1] < -0.4 || gp.axes[7] < -0.4, gp.axes[1] > 0.4 || gp.axes[7] > 0.4, gp.axes[0] < -0.4 || gp.axes[6] < -0.4, gp.axes[0] > 0.4 || gp.axes[6] > 0.4];
-                if (dpad[0].pressed || axes[0]) { this.dispatch(38, 'ArrowUp'); this.lastAxis = now; }
-                else if (dpad[1].pressed || axes[1]) { this.dispatch(40, 'ArrowDown'); this.lastAxis = now; }
-                else if (dpad[2].pressed || axes[2]) { this.dispatch(37, 'ArrowLeft'); this.lastAxis = now; }
-                else if (dpad[3].pressed || axes[3]) { this.dispatch(39, 'ArrowRight'); this.lastAxis = now; }
+                // Map buttons 12-15 AND axes 6-7 (hats) and axes 2-3 (sticks)
+                const up = dpad[0].pressed || gp.axes[1] < -0.4 || gp.axes[7] < -0.4 || gp.axes[3] < -0.4;
+                const down = dpad[1].pressed || gp.axes[1] > 0.4 || gp.axes[7] > 0.4 || gp.axes[3] > 0.4;
+                const left = dpad[2].pressed || gp.axes[0] < -0.4 || gp.axes[6] < -0.4 || gp.axes[2] < -0.4;
+                const right = dpad[3].pressed || gp.axes[0] > 0.4 || gp.axes[6] > 0.4 || gp.axes[2] > 0.4;
+                
+                if (up) { this.dispatch(38, 'ArrowUp'); this.lastAxis = now; }
+                else if (down) { this.dispatch(40, 'ArrowDown'); this.lastAxis = now; }
+                else if (left) { this.dispatch(37, 'ArrowLeft'); this.lastAxis = now; }
+                else if (right) { this.dispatch(39, 'ArrowRight'); this.lastAxis = now; }
             }
             const map = { 0: [13, 'Enter'], 1: [27, 'Escape'], 2: [32, ' '], 3: [83, 's'], 8: [27, 'Escape'], 9: [27, 'Escape'] };
             for(const b in map) {
-                if(gp.buttons[b].pressed && !this.btnStates[b]) this.dispatch(map[b][0], map[b][1]);
-                this.btnStates[b] = gp.buttons[b].pressed;
+                if(gp.buttons[b] && gp.buttons[b].pressed && !this.btnStates[b]) this.dispatch(map[b][0], map[b][1]);
+                if(gp.buttons[b]) this.btnStates[b] = gp.buttons[b].pressed;
             }
         }
         dispatch(c, k) {
